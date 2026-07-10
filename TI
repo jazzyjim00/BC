@@ -1,0 +1,633 @@
+// ==UserScript==
+// @name         ti.live Room Board (direct stream + 6-up grid)
+// @namespace    https://app.ti.live/
+// @version      5.4
+// @description  Signs api.ti.live requests (reverse-engineered CheckSum), lists ALL live rooms sorted by online count (US/UA/RU pinned), plays streams DIRECTLY (Agora subscribe for rtcProvide 1, Tencent TRTC for rtcProvide 2) room-by-room or as a 6-up grid (blob window). Tile click pops out.
+// @match        https://app.ti.live/*
+// @run-at       document-start
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // ========================================================================
+  // CONFIG
+  // ========================================================================
+  const API      = 'https://api.ti.live/vchat/app';
+  const PIN      = ['US', 'UA', 'RU'];   // countries pinned to the top
+  const FAVE_COUNTRIES = ['US', 'UA', 'RU', 'GB'];   // the country-filter tab
+  const PAGE_SZ  = 20;
+  const MAX_PAGE = 40;
+  const GRID_N   = 6;
+  // Fallback: open the site's own room page (used when a room has no direct URL).
+  const ROOM_PAGE = (r) => `https://app.ti.live/video-room?room_id=${r.roomId}&uid=${r.uid}`;
+
+  // ---- auth: replicate the site's request signature -----------------------
+  // Reverse-engineered from app.b75e4093.js. api.ti.live requires a per-request
+  // CheckSum header:
+  //   base = "https://api.ti.live/vchat"
+  //   u    = base + "/app"+endpoint + ("?"+serialize(params) if params)
+  //          + (body ? md5(JSON.stringify(body)) : "") + timestamp + userId + token.slice(0,6)
+  //   CheckSum = md5(u)          (js-md5)   timestamp = Date.now()+""
+  // serialize = Object.entries → encodeURIComponent(k)+"="+encodeURIComponent(v), join("&").
+  // Other required headers (deviceId, channel, bundleId, appVersion, gender:1,
+  // serverVersion:6, …) are sniffed from the site's own calls.
+  const SIGN_BASE = 'https://api.ti.live/vchat';
+  const cookie = (n) => { const m = document.cookie.match('(^|;)\\s*' + n + '\\s*=\\s*([^;]+)'); return m ? m[2] : ''; };
+  const serialize = (p) => Object.entries(p).map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v == null ? '' : v)).join('&');
+
+  // blueimp md5 (MIT) — byte-identical output to the site's js-md5.
+  function md5(str) {
+    function sa(x, y) { const l = (x & 0xFFFF) + (y & 0xFFFF); return (((x >> 16) + (y >> 16) + (l >> 16)) << 16) | (l & 0xFFFF); }
+    function rl(n, c) { return (n << c) | (n >>> (32 - c)); }
+    function cmn(q, a, b, x, s, t) { return sa(rl(sa(sa(a, q), sa(x, t)), s), b); }
+    function ff(a, b, c, d, x, s, t) { return cmn((b & c) | (~b & d), a, b, x, s, t); }
+    function gg(a, b, c, d, x, s, t) { return cmn((b & d) | (c & ~d), a, b, x, s, t); }
+    function hh(a, b, c, d, x, s, t) { return cmn(b ^ c ^ d, a, b, x, s, t); }
+    function ii(a, b, c, d, x, s, t) { return cmn(c ^ (b | ~d), a, b, x, s, t); }
+    function bin(x, len) {
+      x[len >> 5] |= 0x80 << (len % 32); x[(((len + 64) >>> 9) << 4) + 14] = len;
+      let a = 1732584193, b = -271733879, c = -1732584194, d = 271733878;
+      for (let i = 0; i < x.length; i += 16) {
+        const oa = a, ob = b, oc = c, od = d;
+        a = ff(a, b, c, d, x[i], 7, -680876936); d = ff(d, a, b, c, x[i + 1], 12, -389564586); c = ff(c, d, a, b, x[i + 2], 17, 606105819); b = ff(b, c, d, a, x[i + 3], 22, -1044525330);
+        a = ff(a, b, c, d, x[i + 4], 7, -176418897); d = ff(d, a, b, c, x[i + 5], 12, 1200080426); c = ff(c, d, a, b, x[i + 6], 17, -1473231341); b = ff(b, c, d, a, x[i + 7], 22, -45705983);
+        a = ff(a, b, c, d, x[i + 8], 7, 1770035416); d = ff(d, a, b, c, x[i + 9], 12, -1958414417); c = ff(c, d, a, b, x[i + 10], 17, -42063); b = ff(b, c, d, a, x[i + 11], 22, -1990404162);
+        a = ff(a, b, c, d, x[i + 12], 7, 1804603682); d = ff(d, a, b, c, x[i + 13], 12, -40341101); c = ff(c, d, a, b, x[i + 14], 17, -1502002290); b = ff(b, c, d, a, x[i + 15], 22, 1236535329);
+        a = gg(a, b, c, d, x[i + 1], 5, -165796510); d = gg(d, a, b, c, x[i + 6], 9, -1069501632); c = gg(c, d, a, b, x[i + 11], 14, 643717713); b = gg(b, c, d, a, x[i], 20, -373897302);
+        a = gg(a, b, c, d, x[i + 5], 5, -701558691); d = gg(d, a, b, c, x[i + 10], 9, 38016083); c = gg(c, d, a, b, x[i + 15], 14, -660478335); b = gg(b, c, d, a, x[i + 4], 20, -405537848);
+        a = gg(a, b, c, d, x[i + 9], 5, 568446438); d = gg(d, a, b, c, x[i + 14], 9, -1019803690); c = gg(c, d, a, b, x[i + 3], 14, -187363961); b = gg(b, c, d, a, x[i + 8], 20, 1163531501);
+        a = gg(a, b, c, d, x[i + 13], 5, -1444681467); d = gg(d, a, b, c, x[i + 2], 9, -51403784); c = gg(c, d, a, b, x[i + 7], 14, 1735328473); b = gg(b, c, d, a, x[i + 12], 20, -1926607734);
+        a = hh(a, b, c, d, x[i + 5], 4, -378558); d = hh(d, a, b, c, x[i + 8], 11, -2022574463); c = hh(c, d, a, b, x[i + 11], 16, 1839030562); b = hh(b, c, d, a, x[i + 14], 23, -35309556);
+        a = hh(a, b, c, d, x[i + 1], 4, -1530992060); d = hh(d, a, b, c, x[i + 4], 11, 1272893353); c = hh(c, d, a, b, x[i + 7], 16, -155497632); b = hh(b, c, d, a, x[i + 10], 23, -1094730640);
+        a = hh(a, b, c, d, x[i + 13], 4, 681279174); d = hh(d, a, b, c, x[i], 11, -358537222); c = hh(c, d, a, b, x[i + 3], 16, -722521979); b = hh(b, c, d, a, x[i + 6], 23, 76029189);
+        a = hh(a, b, c, d, x[i + 9], 4, -640364487); d = hh(d, a, b, c, x[i + 12], 11, -421815835); c = hh(c, d, a, b, x[i + 15], 16, 530742520); b = hh(b, c, d, a, x[i + 2], 23, -995338651);
+        a = ii(a, b, c, d, x[i], 6, -198630844); d = ii(d, a, b, c, x[i + 7], 10, 1126891415); c = ii(c, d, a, b, x[i + 14], 15, -1416354905); b = ii(b, c, d, a, x[i + 5], 21, -57434055);
+        a = ii(a, b, c, d, x[i + 12], 6, 1700485571); d = ii(d, a, b, c, x[i + 3], 10, -1894986606); c = ii(c, d, a, b, x[i + 10], 15, -1051523); b = ii(b, c, d, a, x[i + 1], 21, -2054922799);
+        a = ii(a, b, c, d, x[i + 8], 6, 1873313359); d = ii(d, a, b, c, x[i + 15], 10, -30611744); c = ii(c, d, a, b, x[i + 6], 15, -1560198380); b = ii(b, c, d, a, x[i + 13], 21, 1309151649);
+        a = ii(a, b, c, d, x[i + 4], 6, -145523070); d = ii(d, a, b, c, x[i + 11], 10, -1120210379); c = ii(c, d, a, b, x[i + 2], 15, 718787259); b = ii(b, c, d, a, x[i + 9], 21, -343485551);
+        a = sa(a, oa); b = sa(b, ob); c = sa(c, oc); d = sa(d, od);
+      }
+      return [a, b, c, d];
+    }
+    function b2r(inp) { let o = ''; for (let i = 0; i < inp.length * 32; i += 8) o += String.fromCharCode((inp[i >> 5] >>> (i % 32)) & 0xFF); return o; }
+    function r2b(inp) { const o = []; o[(inp.length >> 2) - 1] = undefined; for (let i = 0; i < o.length; i++) o[i] = 0; for (let i = 0; i < inp.length * 8; i += 8) o[i >> 5] |= (inp.charCodeAt(i / 8) & 0xFF) << (i % 32); return o; }
+    function r2h(inp) { const h = '0123456789abcdef'; let o = ''; for (let i = 0; i < inp.length; i++) { const x = inp.charCodeAt(i); o += h.charAt((x >>> 4) & 0x0F) + h.charAt(x & 0x0F); } return o; }
+    const s = unescape(encodeURIComponent(str));
+    return r2h(b2r(bin(r2b(s), s.length * 8)));
+  }
+
+  // Sniff the site's non-auth headers (deviceId, channel, bundleId, appVersion…).
+  const capturedHeaders = {};
+  const FORBIDDEN = new Set(['host', 'connection', 'content-length', 'origin', 'referer', 'user-agent',
+    'cookie', 'date', 'accept-encoding', 'accept-charset', 'dnt', 'te', 'trailer', 'transfer-encoding',
+    'upgrade', 'keep-alive', 'via', 'proxy-authorization', 'expect', 'checksum', 'timestamp']);
+  const skippable = (k) => FORBIDDEN.has(k) || k.startsWith('sec-') || k.startsWith('proxy-');
+  const isApi = (u) => typeof u === 'string' && u.indexOf('api.ti.live') > -1;
+  function grab(k, v) { const kk = String(k).toLowerCase(); if (!skippable(kk) && v != null && v !== '') capturedHeaders[kk] = v; }
+
+  (function installSniffer() {
+    const of = window.fetch;
+    window.fetch = function (input, init) {
+      try {
+        const url = typeof input === 'string' ? input : (input && input.url) || '';
+        let h = (init && init.headers) || (typeof input !== 'string' && input && input.headers);
+        if (isApi(url) && h) {
+          if (h instanceof Headers) h.forEach((v, k) => grab(k, v));
+          else if (Array.isArray(h)) h.forEach(([k, v]) => grab(k, v));
+          else Object.keys(h).forEach((k) => grab(k, h[k]));
+        }
+      } catch (e) {}
+      return of.apply(this, arguments);
+    };
+    const oOpen = XMLHttpRequest.prototype.open;
+    const oSet = XMLHttpRequest.prototype.setRequestHeader;
+    XMLHttpRequest.prototype.open = function (m, u) { this.__tiUrl = u; return oOpen.apply(this, arguments); };
+    XMLHttpRequest.prototype.setRequestHeader = function (k, v) { try { if (isApi(this.__tiUrl)) grab(k, v); } catch (e) {} return oSet.apply(this, arguments); };
+  })();
+  window.__tiHeaders = capturedHeaders;
+
+  // endpoint = path after "/app", e.g. "/video_living/rooms/v2". opts.params is
+  // an object; opts.data (rare) becomes a JSON body.
+  async function api(endpoint, opts) {
+    opts = opts || {};
+    const method = (opts.method || 'GET').toUpperCase();
+    const params = opts.params;
+    const data = opts.data;
+    const aurl = '/app' + endpoint;
+    const qs = params ? serialize(params) : '';
+    const ts = Date.now() + '';
+    const bodyHash = data != null ? md5(JSON.stringify(data)) : '';
+    const userId = cookie('userId') || capturedHeaders['userid'] || '';
+    const token = cookie('token') || capturedHeaders['token'] || '';
+    let u = SIGN_BASE + aurl + (qs ? '?' + qs : '') + bodyHash + ts;
+    if (userId) u += userId;
+    if (token) u += token.slice(0, 6);
+    const CheckSum = md5(u);
+    const reqUrl = SIGN_BASE + aurl + (qs ? '?' + qs : '');
+    const headers = { ...capturedHeaders, checksum: CheckSum, timestamp: ts };
+    if (userId && !headers['userid']) headers['userid'] = userId;
+    if (token && !headers['token']) headers['token'] = token;
+    let res;
+    try {
+      res = await fetch(reqUrl, {
+        method, credentials: 'omit', headers,
+        body: method === 'GET' ? undefined : (data != null ? JSON.stringify(data) : ''),
+      });
+    } catch (netErr) {
+      throw new Error('network/CORS on ' + endpoint + ' — ' + netErr.message);
+    }
+    const json = await res.json();
+    if (json.status !== 200) throw new Error(endpoint + ' → ' + json.status + ' ' + json.message);
+    return json.data;
+  }
+
+  // ---- room list ----------------------------------------------------------
+  const rid = (r) => r.strRoomId || String(r.roomId);
+  const dedupe = (arr) => { const m = new Map(); arr.forEach((r) => m.set(rid(r), { ...m.get(rid(r)), ...r })); return [...m.values()]; };
+
+  // Walk pages in concurrent batches until hasMore is false (or the cap is hit).
+  // We can't know the page count up front (the API only returns hasMore), so we
+  // fire BATCH pages at once and stop after the batch that reaches the end —
+  // overfetching at most BATCH-1 empty pages, which dedupe discards.
+  const PAGE_BATCH = 6;
+  async function fetchAllPages(endpoint, makeParams, cap) {
+    const out = [];
+    let page = 1, done = false;
+    while (!done && page <= (cap || 40)) {
+      const batch = [];
+      for (let i = 0; i < PAGE_BATCH && page <= (cap || 40); i++, page++) batch.push(page);
+      const results = await Promise.all(batch.map((p) => api(endpoint, { params: makeParams(p) }).catch(() => null)));
+      for (const d of results) {
+        const rooms = (d && d.rooms) || [];
+        out.push(...rooms);
+        if (!d || !d.hasMore || rooms.length === 0) done = true;
+      }
+    }
+    return out;
+  }
+
+  // Regular tab: the full live list, enumerated.
+  async function fetchRegular() {
+    return dedupe(await fetchAllPages('/video_living/rooms/v2', (page) => ({ page, size: PAGE_SZ, countryFilter: '' }), 60));
+  }
+
+  // Premium tab: enumerate all premium pages.
+  async function fetchPremium() {
+    return dedupe(await fetchAllPages('/video_living/premium/rooms/', (page) => ({ page, size: PAGE_SZ }), 60))
+      .map((r) => ({ ...r, isPremium: true }));
+  }
+
+  // Country tab: enumerate each of FAVE_COUNTRIES via countryFilter, merged.
+  async function fetchFaves() {
+    const per = await Promise.all(FAVE_COUNTRIES.map((c) =>
+      fetchAllPages('/video_living/rooms/v2', (page) => ({ page, size: PAGE_SZ, countryFilter: c }), 30).catch(() => [])));
+    return dedupe(per.flat());
+  }
+
+  function sortRooms(rooms) {
+    const rank = (r) => { const i = PIN.indexOf((r.countryCode || '').toUpperCase()); return i === -1 ? PIN.length : i; };
+    return rooms.slice().sort((a, b) => rank(a) - rank(b) || (b.onlineCount || 0) - (a.onlineCount || 0));
+  }
+
+  // ---- gather everything needed to play one room --------------------------
+  // A single enter call returns provider, Agora appId/token, viewer uid, the
+  // channel (strRoomId) and, for Tencent rooms, the LEB webrtc pull URL.
+  const baseFields = (r) => ({
+    roomId: rid(r), streamerUid: r.uid,
+    name: r.roomName || r.nickname || r.strRoomId || '',
+    country: r.countryCode || '??', count: r.onlineCount || 0,
+  });
+
+  async function getPlayInfo(r) {
+    let e = {}, err = null;
+    try { e = await api(`/video_living/${rid(r)}/enter`, { method: 'POST', params: { support_trtc: true } }); }
+    catch (ex) { err = ex.message; console.warn('[ti-rooms] enter failed', rid(r), ex.message); }
+    const rv = e.roomVo || {};
+    const provide = e.rtcProvide != null ? e.rtcProvide : r.rtcProvide;
+    const appId = e.rtcAppId || null;
+    const token = e.rtcToken || null;
+    return {
+      ...baseFields(r),
+      provide, appId, token,
+      channel: rv.strRoomId || rid(r),
+      viewerUid: (e.me && e.me.uid != null) ? e.me.uid : null,
+      err,
+      dbg: 'p' + provide + ' appId' + (appId ? 1 : 0) + ' tok' + (token ? 1 : 0) + (err ? ' ENTER-FAIL' : ' enterOK'),
+    };
+  }
+
+  // rooms currently playing in some open window (to avoid joining a channel
+  // with our uid twice). Tracked optimistically here; player windows send
+  // 'ti-close' when a tile stops or the window unloads.
+  const openRooms = new Set();
+
+  // ---- open direct player window (1 or up to 6 tiles) ---------------------
+  async function openPlayers(sel) {
+    const chosen = sel.slice(0, GRID_N);
+    const items = await Promise.all(chosen.map(async (r) => {
+      // already playing elsewhere → placeholder tile, don't load again
+      if (openRooms.has(rid(r))) return { ...baseFields(r), provide: r.rtcProvide, alreadyOpen: true };
+      openRooms.add(rid(r));   // optimistic: we're about to load it
+      try { return await getPlayInfo(r); }
+      catch (e) { openRooms.delete(rid(r)); return { ...baseFields(r), provide: r.rtcProvide, err: e && e.message }; }
+    }));
+    renderList();   // reflect open/live state in the list
+    const html = buildPlayerPage(items);
+    const blobUrl = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
+    let feat;
+    if (chosen.length > 1) {
+      feat = 'width=1280,height=860';
+    } else {
+      // single pop-out: 9:16 portrait, as tall as the available screen height
+      const h = (window.screen && window.screen.availHeight) || window.innerHeight || 840;
+      const w = Math.round(h * 9 / 16);
+      feat = `width=${w},height=${h},top=0,left=0`;
+    }
+    window.open(blobUrl, '_blank', feat);
+  }
+
+  // messages from player windows
+  window.addEventListener('message', (e) => {
+    const m = e.data || {};
+    if (!m) return;
+    if (m.type === 'ti-close' && m.roomId) { openRooms.delete(String(m.roomId)); renderList(); }
+    if (m.type === 'ti-popout' && m.roomId) {
+      const room = roomById.get(String(m.roomId));
+      if (room) openPlayers([room]);
+    }
+  });
+
+  // ---- runtime that runs INSIDE the blob player window --------------------
+  // Written as a normal function and serialized via toString(); it may only
+  // reference its `cfg` argument, browser globals, and window.AgoraRTC.
+  function playerRuntime(cfg) {
+    var AG = window.AgoraRTC;
+    var TR = window.TRTC;
+    // Silence autoplay/other blocking dialogs so tiles don't need a click.
+    try { window.alert = function () {}; window.confirm = function () { return true; }; window.prompt = function () { return null; }; } catch (e) {}
+    if (AG) { try { AG.onAutoplayFailed = function () {}; } catch (e) {} }
+    // The RTC SDKs inject a "Resume" autoplay-recovery mask into the DOM. Auto-
+    // click it (resumes the muted video) so the user never has to.
+    (function maskResume() {
+      function zap(root) {
+        try {
+          var nodes = root.querySelectorAll ? root.querySelectorAll('button,div,span,a,p') : [];
+          for (var i = 0; i < nodes.length; i++) {
+            var el = nodes[i], t = (el.textContent || '').trim();
+            if (t && t.length <= 24 && /resume|click to (resume|play)|tap to|恢复|播放/i.test(t)) { try { el.click(); } catch (e) {} try { el.style.display = 'none'; } catch (e) {} }
+          }
+        } catch (e) {}
+      }
+      try {
+        var mo = new MutationObserver(function (muts) {
+          for (var i = 0; i < muts.length; i++) {
+            var an = muts[i].addedNodes;
+            for (var j = 0; j < an.length; j++) { if (an[j].nodeType === 1) zap(an[j]); }
+          }
+        });
+        mo.observe(document.documentElement, { childList: true, subtree: true });
+      } catch (e) {}
+    })();
+    function esc(s) { return (s || '').replace(/[<>&"]/g, ''); }
+    function openPage(room) { window.open(cfg.page + room.roomId + '&uid=' + room.streamerUid, '_blank', 'width=460,height=840'); }
+    function popout(room) { if (window.opener) window.opener.postMessage({ type: 'ti-popout', roomId: room.roomId }, '*'); }
+    // Tell the opener which rooms this window is actually playing, so it won't
+    // load the same channel in another window.
+    var liveRooms = {};
+    function announceClose(id) { if (window.opener) { try { window.opener.postMessage({ type: 'ti-close', roomId: id }, '*'); } catch (e) {} } delete liveRooms[id]; }
+    window.addEventListener('pagehide', function () { Object.keys(liveRooms).forEach(function (id) { if (window.opener) { try { window.opener.postMessage({ type: 'ti-close', roomId: id }, '*'); } catch (e) {} } }); });
+
+    // Tencent TRTC (rtcProvide 2) — join as audience, subscribe to the host.
+    async function playTRTC(media, room) {
+      if (!TR) throw new Error('TRTC SDK unavailable');
+      var trtc = TR.create();
+      var audioUsers = [], muted = true;
+      trtc.on(TR.EVENT.REMOTE_VIDEO_AVAILABLE, function (ev) {
+        try { trtc.startRemoteVideo({ userId: ev.userId, streamType: ev.streamType, view: media }); } catch (e) { console.error('startRemoteVideo', e); }
+      });
+      trtc.on(TR.EVENT.REMOTE_AUDIO_AVAILABLE, function (ev) {
+        audioUsers.push(ev.userId); try { trtc.muteRemoteAudio(ev.userId, muted); } catch (e) {}
+      });
+      // Ignore autoplay-blocked (tiles start muted) so no click-to-dismiss prompt.
+      try { if (TR.EVENT.AUTOPLAY_FAILED) trtc.on(TR.EVENT.AUTOPLAY_FAILED, function () {}); } catch (e) {}
+      await trtc.enterRoom({
+        sdkAppId: Number(room.appId), userId: String(room.viewerUid),
+        userSig: room.token, strRoomId: room.channel, scene: 'live', role: 'audience',
+      });
+      return {
+        setMuted: function (m) { muted = m; audioUsers.forEach(function (u) { try { trtc.muteRemoteAudio(u, m); } catch (e) {} }); },
+        stop: function () { try { return trtc.exitRoom(); } catch (e) {} },
+      };
+    }
+
+    // Agora (rtcProvide 1)
+    async function playAgora(media, room) {
+      if (!AG) throw new Error('Agora SDK unavailable');
+      var client = AG.createClient({ mode: 'live', codec: 'vp8' });
+      if (client.setClientRole) { try { await client.setClientRole('audience'); } catch (e) {} }
+      var audios = [], muted = true;
+      client.on('user-published', async function (user, kind) {
+        try {
+          await client.subscribe(user, kind);
+          if (kind === 'video' && user.videoTrack) user.videoTrack.play(media);
+          // Don't play audio while muted — playing it triggers the autoplay
+          // "Media Playback error" prompt. Defer until the user unmutes.
+          if (kind === 'audio' && user.audioTrack) { audios.push(user.audioTrack); if (!muted) { try { user.audioTrack.setVolume(100); user.audioTrack.play(); } catch (e) {} } }
+        } catch (e) { console.error('subscribe', e); }
+      });
+      await client.join(room.appId, room.channel, room.token || null, room.viewerUid == null ? null : room.viewerUid);
+      return {
+        setMuted: function (m) { muted = m; audios.forEach(function (a) { try { a.setVolume(m ? 0 : 100); if (!m) a.play(); } catch (e) {} }); },
+        stop: function () { try { return client.leave(); } catch (e) {} },
+      };
+    }
+
+    // Image controls (single pop-out window): brightness/contrast/saturation/
+    // alpha sliders behind a gear button, applied as CSS filters on the media.
+    function addImageControls(cell, bar, media) {
+      var st = { bright: 100, contrast: 100, sat: 100, alpha: 100 };
+      function apply() {
+        media.style.filter = 'brightness(' + st.bright + '%) contrast(' + st.contrast + '%) saturate(' + st.sat + '%)';
+        media.style.opacity = String(st.alpha / 100);
+      }
+      var btn = document.createElement('button'); btn.className = 'mb'; btn.innerHTML = '&#9881;'; btn.title = 'image controls';
+      bar.appendChild(btn);
+      var panel = document.createElement('div');
+      panel.style.cssText = 'position:absolute;top:36px;right:6px;z-index:6;background:rgba(18,18,18,.94);border:1px solid #444;border-radius:8px;padding:10px 12px;width:214px;display:none;font:12px system-ui,sans-serif;color:#eee';
+      var rows = [];
+      [['Brightness', 'bright', 0, 300], ['Contrast', 'contrast', 0, 300], ['Saturation', 'sat', 0, 300], ['Alpha', 'alpha', 10, 100]].forEach(function (d) {
+        var wrap = document.createElement('div'); wrap.style.cssText = 'margin-bottom:9px';
+        var lab = document.createElement('div'); lab.style.cssText = 'display:flex;justify-content:space-between;margin-bottom:3px';
+        var nm = document.createElement('span'); nm.textContent = d[0];
+        var val = document.createElement('span'); val.style.color = '#8cf'; val.textContent = st[d[1]] + '%';
+        lab.appendChild(nm); lab.appendChild(val);
+        var sl = document.createElement('input'); sl.type = 'range'; sl.min = d[2]; sl.max = d[3]; sl.value = st[d[1]]; sl.step = 1; sl.style.width = '100%';
+        sl.oninput = function (e) { e.stopPropagation(); st[d[1]] = +sl.value; val.textContent = sl.value + '%'; apply(); };
+        sl.onclick = function (e) { e.stopPropagation(); };
+        wrap.appendChild(lab); wrap.appendChild(sl); panel.appendChild(wrap);
+        rows.push({ key: d[1], sl: sl, val: val });
+      });
+      var reset = document.createElement('button'); reset.textContent = 'reset';
+      reset.style.cssText = 'width:100%;background:#2b2b2b;color:#eee;border:1px solid #444;border-radius:6px;padding:4px 0;cursor:pointer;font:12px system-ui';
+      reset.onclick = function (e) { e.stopPropagation(); rows.forEach(function (r) { st[r.key] = 100; r.sl.value = 100; r.val.textContent = '100%'; }); apply(); };
+      panel.appendChild(reset);
+      cell.appendChild(panel);
+      btn.onclick = function (e) { e.stopPropagation(); panel.style.display = panel.style.display === 'none' ? 'block' : 'none'; };
+    }
+
+    var grid = document.getElementById('grid');
+    cfg.rooms.forEach(function (room) {
+      var cell = document.createElement('div'); cell.className = 'cell';
+      var media = document.createElement('div'); media.className = 'media';
+      var bar = document.createElement('div'); bar.className = 'bar';
+      bar.innerHTML = '<span class=flag>' + esc(room.country) + '</span><span class=nm>' + esc(room.name) + '</span><span class=cnt>&#128100; ' + room.count + '</span>';
+      var inGrid = cfg.rooms.length > 1;
+      var mute = document.createElement('button'); mute.className = 'mb'; mute.innerHTML = '&#128263;'; mute.style.opacity = '0.5';
+      bar.appendChild(mute);
+      if (inGrid) { var pop = document.createElement('button'); pop.className = 'mb'; pop.innerHTML = '&#8689;'; pop.title = 'open in its own window'; bar.appendChild(pop); }
+      else addImageControls(cell, bar, media);
+      var hit = document.createElement('div'); hit.className = 'hit';
+      var st = document.createElement('div'); st.className = 'st'; st.textContent = 'connecting…';
+      cell.appendChild(media); cell.appendChild(bar); cell.appendChild(hit); cell.appendChild(st);
+      grid.appendChild(cell);
+
+      var player = null, isMuted = true, popping = false;
+      function setMute(m) { isMuted = m; mute.style.opacity = m ? '0.5' : '1'; if (player && player.setMuted) player.setMuted(m); }
+      // Leave the channel HERE before the standalone window joins it, so the
+      // same viewer uid isn't in the same room twice.
+      async function popoutTile() {
+        if (popping) return;
+        popping = true;
+        st.style.display = 'flex'; st.innerHTML = '&#8599; opening in its own window…';
+        if (player && player.stop) { try { await player.stop(); } catch (e) {} }
+        player = null;
+        announceClose(room.roomId);   // free it in the opener before the single window joins
+        try { while (media.firstChild) media.removeChild(media.firstChild); } catch (e) {}
+        await new Promise(function (r) { setTimeout(r, 250); });   // let the RTC server release the uid
+        popout(room);
+        st.innerHTML = '&#8599; opened in its own window<br><u>click to reopen</u>';
+        st.onclick = function () { popout(room); };
+        popping = false;
+      }
+      mute.onclick = function (ev) { ev.stopPropagation(); if (room.alreadyOpen) return; setMute(!isMuted); };
+      if (inGrid) pop.onclick = function (ev) { ev.stopPropagation(); if (room.alreadyOpen) return; popoutTile(); };
+      hit.onclick = function () { if (room.alreadyOpen) return; if (inGrid) popoutTile(); else setMute(!isMuted); };
+      function fail(msg) { st.style.display = 'flex'; st.innerHTML = '&#9888; ' + esc(msg) + '<br><small style="color:#888">' + esc(room.dbg || '') + (room.err ? ' · ' + esc(room.err) : '') + '</small><br><u>open room page</u>'; st.onclick = function () { openPage(room); }; }
+
+      console.log('[ti-tile]', room.roomId, room.dbg, room.err || '', room);
+      if (room.alreadyOpen) { st.style.display = 'flex'; st.innerHTML = '&#128274; already open<br>in another window'; return; }
+      var pr = null;
+      if (room.provide === 1 && room.appId) pr = playAgora(media, room);
+      else if (room.provide === 2 && room.appId) pr = playTRTC(media, room);
+      else fail('no direct stream');
+      if (pr) pr.then(function (p) { player = p; if (p.setMuted) p.setMuted(true); st.style.display = 'none'; liveRooms[room.roomId] = true; })
+              .catch(function (e) { fail((e && e.message) || 'failed'); announceClose(room.roomId); });
+    });
+  }
+
+  // ---- build the blob player page (loads Agora SDK, then the runtime) -----
+  function buildPlayerPage(items) {
+    const n = items.length;
+    const cols = n <= 1 ? 1 : (n <= 4 ? 2 : 3);
+    const cfg = { rooms: items, page: 'https://app.ti.live/video-room?room_id=' };
+    const cfgJson = JSON.stringify(cfg).replace(/</g, '\\u003c');
+
+    // Load both RTC SDKs (Agora = rtcProvide 1, Tencent TRTC = rtcProvide 2),
+    // then boot once all have settled (loaded or failed).
+    const inner =
+      'var CFG=' + cfgJson + ';\n' +
+      'var __RT__=' + playerRuntime.toString() + ';\n' +
+      'function boot(){ try{ __RT__(CFG); }catch(e){ console.error(e); } }\n' +
+      'var SDKS=["https://download.agora.io/sdk/release/AgoraRTC_N-4.24.3.js",' +
+      '"https://web.sdk.qcloud.com/trtc/webrtc/v5/dist/trtc.js"];\n' +
+      'var left=SDKS.length; function done(){ if(--left<=0) boot(); }\n' +
+      'SDKS.forEach(function(src){ var s=document.createElement("script"); s.src=src; s.onload=done; s.onerror=done; document.head.appendChild(s); });\n';
+
+    return '<!doctype html><html><head><meta charset="utf-8"><title>ti.live stream' + (n > 1 ? ' grid' : '') + '</title>' +
+      '<style>' +
+      'html,body{margin:0;height:100%;background:#000;color:#eee;font:13px system-ui,sans-serif}' +
+      '#grid{display:grid;grid-template-columns:repeat(' + cols + ',1fr);gap:2px;height:100vh}' +
+      '.cell{position:relative;background:#111;overflow:hidden}' +
+      '.media{position:absolute;inset:0}' +
+      '.media video{width:100%!important;height:100%!important;object-fit:contain!important;background:#000}' +
+      '.bar{position:absolute;top:0;left:0;right:0;z-index:3;display:flex;align-items:center;gap:6px;padding:4px 6px;background:linear-gradient(#000a,#0000)}' +
+      '.flag{background:#333;border-radius:3px;padding:0 5px;font-size:11px}' +
+      '.nm{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}' +
+      '.cnt{color:#8c8}' +
+      '.mb{background:#0006;color:#fff;border:0;border-radius:5px;padding:2px 7px;cursor:pointer;font-size:13px}' +
+      '.hit{position:absolute;inset:0;z-index:2;cursor:pointer}' +
+      '.st{position:absolute;inset:0;z-index:4;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;color:#bbb;background:#0008;cursor:pointer}' +
+      '.st u{color:#6cf}' +
+      '</style></head><body><div id="grid"></div><script>' + inner + '<\/script></body></html>';
+  }
+
+  // ---- UI -----------------------------------------------------------------
+  let box, listEl, statusEl, tabBar, rooms = [];
+  let activeTab = 'regular';
+  const cache = { regular: null, premium: null, faves: null };
+  const tabBtns = {};
+  const selected = new Set();
+  const roomById = new Map();
+
+  function buildUI() {
+    box = document.createElement('div');
+    box.style.cssText = 'position:fixed;top:10px;left:10px;width:340px;max-height:88vh;display:flex;flex-direction:column;z-index:2147483647;background:#141414;color:#eee;font:13px/1.4 system-ui,sans-serif;border:1px solid #333;border-radius:10px;box-shadow:0 6px 26px rgba(0,0,0,.6)';
+
+    const head = document.createElement('div');
+    head.style.cssText = 'display:flex;gap:6px;align-items:center;padding:8px 10px;background:#1c1c1c;border-bottom:1px solid #2a2a2a;border-radius:10px 10px 0 0;cursor:move';
+    head.innerHTML = '<b style="color:#6cf;flex:1">ti.live rooms</b>';
+    const mk = (t, fn, extra) => { const b = document.createElement('button'); b.textContent = t; b.style.cssText = 'font:12px system-ui;background:#2b2b2b;color:#eee;border:1px solid #444;border-radius:6px;padding:3px 8px;cursor:pointer;' + (extra || ''); b.onclick = fn; return b; };
+    head.appendChild(mk('⟳', () => loadTab(true), 'font-size:14px'));
+    head.appendChild(mk('grid 6', () => openPlayers(pickForGrid()), 'background:#164a2a;border-color:#2a6'));
+    head.appendChild(mk('▾', () => { const h = listEl.style.display === 'none'; listEl.style.display = h ? 'block' : 'none'; }));
+
+    // tab bar
+    tabBar = document.createElement('div');
+    tabBar.style.cssText = 'display:flex;border-bottom:1px solid #2a2a2a';
+    const mkTab = (key, label) => {
+      const b = document.createElement('button');
+      b.textContent = label;
+      b.style.cssText = 'flex:1;font:12px system-ui;background:transparent;color:#aaa;border:0;border-bottom:2px solid transparent;padding:7px 0;cursor:pointer';
+      b.onclick = () => selectTab(key);
+      tabBtns[key] = b;
+      return b;
+    };
+    tabBar.appendChild(mkTab('regular', 'Regular'));
+    tabBar.appendChild(mkTab('premium', '★ Premium'));
+    tabBar.appendChild(mkTab('faves', FAVE_COUNTRIES.join('·')));
+
+    statusEl = document.createElement('div');
+    statusEl.style.cssText = 'padding:5px 10px;color:#999;border-bottom:1px solid #222';
+    listEl = document.createElement('div');
+    listEl.style.cssText = 'overflow:auto;padding:4px 0';
+
+    box.append(head, tabBar, statusEl, listEl);
+    document.body.appendChild(box);
+    dragify(box, head);
+    updateTabStyles();
+    loadTab(false);
+  }
+
+  function updateTabStyles() {
+    Object.entries(tabBtns).forEach(([k, b]) => {
+      const on = k === activeTab;
+      b.style.color = on ? '#6cf' : '#aaa';
+      b.style.borderBottomColor = on ? '#6cf' : 'transparent';
+      b.style.background = on ? '#181818' : 'transparent';
+    });
+  }
+
+  function selectTab(key) {
+    if (key === activeTab) return;
+    activeTab = key;
+    selected.clear();
+    updateTabStyles();
+    loadTab(true);   // always re-fetch the list when switching tabs
+  }
+
+  function pickForGrid() {
+    if (selected.size) return rooms.filter((r) => selected.has(rid(r)));
+    return rooms.slice(0, GRID_N);
+  }
+
+  function renderRow(r) {
+    const row = document.createElement('div');
+    const pinned = PIN.includes((r.countryCode || '').toUpperCase());
+    row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:5px 10px;border-bottom:1px solid #1e1e1e;' + (pinned ? 'background:#15201a' : '');
+
+    const cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.checked = selected.has(rid(r));
+    cb.onchange = () => { cb.checked ? selected.add(rid(r)) : selected.delete(rid(r)); updateStatus(); };
+
+    const thumb = document.createElement('div');
+    thumb.style.cssText = `width:34px;height:34px;border-radius:6px;flex:0 0 auto;background:#333 center/cover no-repeat;${r.frontImage ? `background-image:url('${r.frontImage}')` : ''}`;
+
+    const meta = document.createElement('div');
+    meta.style.cssText = 'flex:1;min-width:0';
+    meta.innerHTML =
+      `<div style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${(r.roomName || r.nickname || r.strRoomId || '').replace(/[<>&]/g, '')}${r.isPremium ? ' <span style="color:#e6b04a">★</span>' : ''}</div>` +
+      `<div style="color:#888;font-size:11px">${openRooms.has(rid(r)) ? '<span style="color:#5c5">● open</span> · ' : ''}<span style="color:${pinned ? '#6f6' : '#9bd'}">${r.countryCode || '??'}</span> · 👤 ${r.onlineCount || 0}</div>`;
+
+    const play = document.createElement('button');
+    play.textContent = '▶ play';
+    play.style.cssText = 'font:12px system-ui;background:#22406a;color:#dff;border:1px solid #356;border-radius:6px;padding:3px 9px;cursor:pointer';
+    play.onclick = () => openPlayers([r]);
+
+    row.append(cb, thumb, meta, play);
+    return row;
+  }
+
+  // Rows are chunked into groups of GRID_N, each led by a divider with a
+  // button that launches exactly those rooms as a grid.
+  function renderList() {
+    listEl.innerHTML = '';
+    for (let start = 0; start < rooms.length; start += GRID_N) {
+      const group = rooms.slice(start, start + GRID_N);
+
+      const divider = document.createElement('div');
+      divider.style.cssText = 'display:flex;align-items:center;gap:8px;padding:6px 10px;background:#12271a;border-top:1px solid #2a2a2a;border-bottom:1px solid #223;';
+      const label = document.createElement('span');
+      label.style.cssText = 'flex:1;color:#8aa892;font-size:11px;letter-spacing:.3px';
+      label.textContent = `rooms ${start + 1}–${start + group.length}`;
+      const gbtn = document.createElement('button');
+      gbtn.textContent = `▶ grid these ${group.length}`;
+      gbtn.style.cssText = 'font:12px system-ui;background:#164a2a;color:#dff;border:1px solid #2a6;border-radius:6px;padding:3px 9px;cursor:pointer';
+      gbtn.onclick = () => openPlayers(group);
+      divider.append(label, gbtn);
+      listEl.appendChild(divider);
+
+      group.forEach((r) => listEl.appendChild(renderRow(r)));
+    }
+    updateStatus();
+  }
+
+  function updateStatus() {
+    const pins = rooms.filter((r) => PIN.includes((r.countryCode || '').toUpperCase())).length;
+    statusEl.textContent = `${activeTab} · ${rooms.length} rooms · ${pins} pinned · ${selected.size} picked`;
+  }
+
+  let loadTries = 0;
+  async function loadTab(force) {
+    if (!Object.keys(capturedHeaders).length) {
+      loadTries++;
+      statusEl.textContent = loadTries > 8
+        ? '⚠ no auth headers seen yet — click a room on the site once, then ⟳'
+        : 'learning auth headers from the site… (' + loadTries + ')';
+      clearTimeout(loadTab._t); loadTab._t = setTimeout(() => loadTab(force), 1500);
+      return;
+    }
+    loadTries = 0;
+    if (force) cache[activeTab] = null;
+    if (cache[activeTab]) { rooms = cache[activeTab]; renderList(); return; }
+    statusEl.textContent = activeTab === 'premium' ? 'enumerating premium…'
+      : activeTab === 'faves' ? 'loading ' + FAVE_COUNTRIES.join('/') + '…' : 'loading all rooms…';
+    try {
+      const raw = activeTab === 'premium' ? await fetchPremium()
+        : activeTab === 'faves' ? await fetchFaves() : await fetchRegular();
+      const sorted = sortRooms(raw.filter((r) => r.inLive !== false));
+      cache[activeTab] = sorted;
+      sorted.forEach((r) => roomById.set(rid(r), r));
+      rooms = sorted;
+      renderList();
+    } catch (e) {
+      statusEl.textContent = '⚠ ' + e.message;
+      console.error('[ti-rooms]', e);
+    }
+  }
+
+  function dragify(el, handle) {
+    let sx, sy, ox, oy, drag = false;
+    handle.addEventListener('mousedown', (e) => {
+      if (e.target.tagName === 'BUTTON') return;
+      drag = true; sx = e.clientX; sy = e.clientY;
+      const r = el.getBoundingClientRect(); ox = r.left; oy = r.top; e.preventDefault();
+    });
+    window.addEventListener('mousemove', (e) => { if (!drag) return; el.style.left = ox + (e.clientX - sx) + 'px'; el.style.top = oy + (e.clientY - sy) + 'px'; });
+    window.addEventListener('mouseup', () => { drag = false; });
+  }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', buildUI);
+  else buildUI();
+})();
