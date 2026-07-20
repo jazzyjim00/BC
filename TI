@@ -15,7 +15,7 @@
   // CONFIG
   // ========================================================================
   const API      = 'https://api.ti.live/vchat/app';
-  const PIN      = ['US', 'UA', 'RU'];   // countries pinned to the top
+  const PIN      = ['US', 'UA', 'RU','AD','AT','AU','BE','BG','BY','CA','CH','CO','CY','CZ','DE','DK','EE','ES','FI','FR','GR','HR','HU','IE','IS','IT','LI','LT','LU','LV','MC','MD','ME','MK','MT','NL','NO','NZ','PL','PT','RO','RS','SE','SI','SK','SM','VA'];   // countries pinned to the top
   const FAVE_COUNTRIES = ['US', 'UA', 'RU', 'GB'];   // the country-filter tab
   const PAGE_SZ  = 20;
   const MAX_PAGE = 40;
