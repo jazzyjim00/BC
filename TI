@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ti.live Room Board (direct stream + 6-up grid)
 // @namespace    https://app.ti.live/
-// @version      5.4
-// @description  Signs api.ti.live requests (reverse-engineered CheckSum), lists ALL live rooms sorted by online count (US/UA/RU pinned), plays streams DIRECTLY (Agora subscribe for rtcProvide 1, Tencent TRTC for rtcProvide 2) room-by-room or as a 6-up grid (blob window). Tile click pops out.
+// @version      5.6
+// @description  Signs api.ti.live requests (reverse-engineered CheckSum), lists ALL live rooms sorted by online count (US/UA/RU pinned), plays streams DIRECTLY (Agora subscribe for rtcProvide 1, Tencent TRTC for rtcProvide 2) room-by-room or as a 6-up grid (blob window). Tile click pops out. Ghost tracking keeps rooms that vanish from the listings, shows rooms the API flags inLive=false, and probes ghosts to see which are still enterable.
 // @match        https://app.ti.live/*
 // @run-at       document-start
 // @grant        none
@@ -20,6 +20,17 @@
   const PAGE_SZ  = 20;
   const MAX_PAGE = 40;
   const GRID_N   = 6;
+  const POLL_MS  = 45000;          // watch mode: full re-scan of every list
+  const GHOST_TTL = 45 * 60 * 1000; // forget ghosts after this long
+  const MISS_STRIKES = 2;          // consecutive absences before calling it gone
+  // Auto-probe: the moment a room becomes a ghost, call /enter once to find out
+  // whether it's still alive-but-unlisted or simply over. Costs one enter call
+  // per vanished room — the server may count that as a view. Set false to make
+  // probing manual (the 🔍 button) only.
+  const AUTO_PROBE = true;
+  const PROBE_GAP_MS = 1500;       // serialise probes so we don't burst the API
+  // After a probe says a ghost is still alive, hunt for the list it moved to.
+  const AUTO_LOCATE = true;
   // Fallback: open the site's own room page (used when a room has no direct URL).
   const ROOM_PAGE = (r) => `https://app.ti.live/video-room?room_id=${r.roomId}&uid=${r.uid}`;
 
@@ -87,11 +98,29 @@
   const isApi = (u) => typeof u === 'string' && u.indexOf('api.ti.live') > -1;
   function grab(k, v) { const kk = String(k).toLowerCase(); if (!skippable(kk) && v != null && v !== '') capturedHeaders[kk] = v; }
 
+  // Every distinct api.ti.live path the site itself calls. If rooms are moving
+  // to a listing we don't know about, its endpoint shows up here the first time
+  // the site's own UI asks for it — watch the console for [ti-sniff].
+  const seenEndpoints = new Map();
+  function noteEndpoint(method, url) {
+    try {
+      if (!isApi(String(url))) return;
+      const u = new URL(url, location.href);
+      const key = (method || 'GET').toUpperCase() + ' ' + u.pathname;
+      if (!seenEndpoints.has(key)) {
+        seenEndpoints.set(key, u.search || '');
+        console.log('[ti-sniff] new endpoint', key, u.search || '');
+      }
+    } catch (e) {}
+  }
+  window.__tiEndpoints = seenEndpoints;
+
   (function installSniffer() {
     const of = window.fetch;
     window.fetch = function (input, init) {
       try {
         const url = typeof input === 'string' ? input : (input && input.url) || '';
+        noteEndpoint((init && init.method) || (typeof input !== 'string' && input && input.method) || 'GET', url);
         let h = (init && init.headers) || (typeof input !== 'string' && input && input.headers);
         if (isApi(url) && h) {
           if (h instanceof Headers) h.forEach((v, k) => grab(k, v));
@@ -103,7 +132,7 @@
     };
     const oOpen = XMLHttpRequest.prototype.open;
     const oSet = XMLHttpRequest.prototype.setRequestHeader;
-    XMLHttpRequest.prototype.open = function (m, u) { this.__tiUrl = u; return oOpen.apply(this, arguments); };
+    XMLHttpRequest.prototype.open = function (m, u) { this.__tiUrl = u; try { noteEndpoint(m, u); } catch (e) {} return oOpen.apply(this, arguments); };
     XMLHttpRequest.prototype.setRequestHeader = function (k, v) { try { if (isApi(this.__tiUrl)) grab(k, v); } catch (e) {} return oSet.apply(this, arguments); };
   })();
   window.__tiHeaders = capturedHeaders;
@@ -151,31 +180,60 @@
   // We can't know the page count up front (the API only returns hasMore), so we
   // fire BATCH pages at once and stop after the batch that reaches the end —
   // overfetching at most BATCH-1 empty pages, which dedupe discards.
+  // NOTE: the server re-sorts by online count while we walk, so a room can slip
+  // across a page boundary and be missed by a scan. That's why a single absence
+  // never marks a room gone — see MISS_STRIKES.
+  // Why the walk stopped matters: a server that truncates a ranked list will
+  // report hasMore:false at a suspiciously round total, and rooms drop off the
+  // bottom as their viewer count falls — no flag flips, no list changes, they
+  // are simply ranked out. walkStats records the evidence.
+  const walkStats = {};
   const PAGE_BATCH = 6;
-  async function fetchAllPages(endpoint, makeParams, cap) {
+  async function fetchAllPages(endpoint, makeParams, cap, statKey) {
     const out = [];
-    let page = 1, done = false;
-    while (!done && page <= (cap || 40)) {
+    const CAP = cap || 40;
+    let page = 1, done = false, pages = 0, errors = 0, ended = 'cap';
+    while (!done && page <= CAP) {
       const batch = [];
-      for (let i = 0; i < PAGE_BATCH && page <= (cap || 40); i++, page++) batch.push(page);
-      const results = await Promise.all(batch.map((p) => api(endpoint, { params: makeParams(p) }).catch(() => null)));
-      for (const d of results) {
+      for (let i = 0; i < PAGE_BATCH && page <= CAP; i++, page++) batch.push(page);
+      // One retry per page. A page that fails must NOT end the walk — the old
+      // code treated a null result as end-of-list, so a single failed request
+      // silently truncated the enumeration and every page after it was never
+      // fetched. That alone could hide arbitrary rooms from the board.
+      const results = await Promise.all(batch.map(async (p) => {
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try { return { p, d: await api(endpoint, { params: makeParams(p) }) }; }
+          catch (e) {
+            if (attempt) { errors++; console.warn('[ti-rooms] page', p, 'failed twice on', endpoint, e.message); return { p, d: null }; }
+            await new Promise((r) => setTimeout(r, 300));
+          }
+        }
+      }));
+      results.sort((a, b) => a.p - b.p);
+      for (const { d } of results) {
         const rooms = (d && d.rooms) || [];
         out.push(...rooms);
-        if (!d || !d.hasMore || rooms.length === 0) done = true;
+        if (d) pages++;
+        // Only a page that actually reports the end stops the walk.
+        if (d && (!d.hasMore || rooms.length === 0)) {
+          done = true; ended = rooms.length ? 'hasMore:false' : 'empty page';
+          break;
+        }
       }
     }
+    if (errors) ended += ' · ' + errors + ' page(s) failed';
+    if (statKey) walkStats[statKey] = { pages, ended, errors, raw: out.length, cap: CAP };
     return out;
   }
 
   // Regular tab: the full live list, enumerated.
   async function fetchRegular() {
-    return dedupe(await fetchAllPages('/video_living/rooms/v2', (page) => ({ page, size: PAGE_SZ, countryFilter: '' }), 60));
+    return dedupe(await fetchAllPages('/video_living/rooms/v2', (page) => ({ page, size: PAGE_SZ, countryFilter: '' }), 60, 'regular'));
   }
 
   // Premium tab: enumerate all premium pages.
   async function fetchPremium() {
-    return dedupe(await fetchAllPages('/video_living/premium/rooms/', (page) => ({ page, size: PAGE_SZ }), 60))
+    return dedupe(await fetchAllPages('/video_living/premium/rooms/', (page) => ({ page, size: PAGE_SZ }), 60, 'premium'))
       .map((r) => ({ ...r, isPremium: true }));
   }
 
@@ -191,6 +249,301 @@
     return rooms.slice().sort((a, b) => rank(a) - rank(b) || (b.onlineCount || 0) - (a.onlineCount || 0));
   }
 
+  // ========================================================================
+  // ROOM REGISTRY / GHOST TRACKING
+  // ========================================================================
+  // Rooms drop off the public listings while their RTC channel keeps running —
+  // an already-joined tile keeps playing long after the room is unlistable. To
+  // find out *why*, we keep the last raw payload for every room we've ever seen
+  // and diff it against every later sighting (and against what /enter reports
+  // once the room is gone). The field that flips is the answer.
+  //
+  //   registry: rid -> {
+  //     id, last, first, lastSeen,
+  //     seenIn:  { tab: ts }     tabs this room has ever appeared in
+  //     miss:    { tab: n }      consecutive scans of that tab without it
+  //     goneFrom:{ tab: ts }     when it hit MISS_STRIKES in that tab
+  //     history: [{ t, ev, diff, raw, err }]
+  //   }
+  const registry = new Map();
+
+  // Volatile fields — they churn every scan and would drown the real signal.
+  const SKIP_DIFF = new Set(['onlineCount', 'frontImage', 'avatar', 'timestamp', 'ts',
+    'hotValue', 'heat', 'rank', 'sort', 'sortValue', 'distance', 'lastActiveTime', 'updateTime']);
+
+  function diffRooms(a, b) {
+    if (!a || !b) return [];
+    const out = [];
+    const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+    for (const k of keys) {
+      if (SKIP_DIFF.has(k)) continue;
+      const x = a[k], y = b[k];
+      if ((x && typeof x === 'object') || (y && typeof y === 'object')) continue;
+      if (x !== y) out.push(k + ': ' + JSON.stringify(x) + ' → ' + JSON.stringify(y));
+    }
+    return out;
+  }
+
+  function push(e, ev, extra) {
+    e.history.push({ t: Date.now(), ev, ...(extra || {}) });
+    if (e.history.length > 40) e.history.splice(0, e.history.length - 40);
+  }
+
+  function noteSeen(r, tab, stamp, note) {
+    const id = rid(r);
+    let e = registry.get(id);
+    if (!e) {
+      e = { id, first: stamp, seenIn: {}, miss: {}, goneFrom: {}, history: [], last: null };
+      registry.set(id, e);
+      push(e, 'first seen in ' + tab + (note ? ' (' + note + ')' : ''));
+    }
+    if (e.goneFrom[tab]) {
+      const gap = Math.round((stamp - e.goneFrom[tab]) / 1000);
+      push(e, 'reappeared in ' + tab + ' after ' + gap + 's', { diff: diffRooms(e.last, r) });
+      console.log('[ti-ghost] reappeared in', tab, id, 'after', gap + 's', diffRooms(e.last, r));
+      delete e.goneFrom[tab];
+      e.probed = false; e.verdict = null;   // re-probe if it vanishes again
+    } else if (e.last) {
+      const d = diffRooms(e.last, r);
+      if (d.length) push(e, 'changed in ' + tab, { diff: d });
+    }
+    // The exact moment a room is hidden while still being returned by the API.
+    // This is the transition worth catching: the room does not leave, it gets
+    // flagged — which looks identical to "disappeared" from the UI.
+    if (e.last && e.last.inLive !== false && r.inLive === false) {
+      push(e, 'HIDDEN: inLive true→false in ' + tab + ' at ' + (r.onlineCount || 0) + ' viewers');
+      console.log('%c[ti-ghost] HIDDEN (inLive true→false)', 'color:#e0b060;font-weight:bold', id,
+        (r.roomName || r.nickname || ''), r.onlineCount + ' viewers', diffRooms(e.last, r));
+    }
+    if (note) push(e, note + ' in ' + tab);
+    e.last = r;
+    e.lastSeen = stamp;
+    e.seenIn[tab] = stamp;
+    e.miss[tab] = 0;
+    return e;
+  }
+
+  // A ghost is a room that has gone missing from every list it used to be in.
+  const isGhost = (e) => {
+    const tabs = Object.keys(e.seenIn);
+    return tabs.length > 0 && tabs.every((t) => e.goneFrom[t]);
+  };
+  const goneAt = (e) => Math.max(...Object.values(e.goneFrom).map(Number), 0);
+
+  // Verdict order: the interesting ones (alive, or not yet judged) float to the
+  // top; confirmed-ended rooms sink. Within a band, most recently gone first.
+  const VERDICT_RANK = { moved: 0, alive: 1, unclear: 2, probing: 3, queued: 3, dead: 4, ended: 5 };
+  const vrank = (e) => (e.verdict ? (VERDICT_RANK[e.verdict.state] != null ? VERDICT_RANK[e.verdict.state] : 3) : 3);
+
+  function ghosts() {
+    const now = Date.now();
+    const out = [];
+    registry.forEach((e, id) => {
+      if (!isGhost(e)) return;
+      if (now - goneAt(e) > GHOST_TTL) { registry.delete(id); return; }
+      out.push(e);
+    });
+    return out.sort((a, b) => vrank(a) - vrank(b) || goneAt(b) - goneAt(a));
+  }
+
+  const TABS = ['regular', 'premium', 'faves'];
+  const fetchers = { regular: fetchRegular, premium: fetchPremium, faves: fetchFaves };
+
+  // One scan of one list. Feeds the registry, ages out absent rooms, and
+  // refreshes that tab's cache.
+  async function scanTab(tab) {
+    const raw = await fetchers[tab]();
+    const stamp = Date.now();
+    const live = raw.filter((r) => r.inLive !== false);
+    // Rooms the API still returns but flags as not-live. The old build dropped
+    // these on the floor; they're a prime suspect for "vanished but streaming".
+    const flagged = raw.filter((r) => r.inLive === false);
+
+    const present = new Set();
+    live.forEach((r) => { present.add(rid(r)); noteSeen(r, tab, stamp); });
+    flagged.forEach((r) => { present.add(rid(r)); noteSeen(r, tab, stamp, 'inLive=false'); });
+
+    registry.forEach((e) => {
+      if (!e.seenIn[tab] || present.has(e.id) || e.goneFrom[tab]) return;
+      e.miss[tab] = (e.miss[tab] || 0) + 1;
+      if (e.miss[tab] >= MISS_STRIKES) {
+        e.goneFrom[tab] = stamp;
+        push(e, 'vanished from ' + tab + ' at ' + ((e.last && e.last.onlineCount) || 0) + ' viewers');
+        const where = TABS.filter((t) => t !== tab && e.seenIn[t] && !e.goneFrom[t]);
+        console.log('[ti-ghost] vanished from', tab, e.id,
+          (e.last && (e.last.roomName || e.last.nickname)) || '',
+          where.length ? 'still in: ' + where.join(',') : 'GONE FROM ALL LISTS', e.last);
+        // Off every list it was in → it's a ghost now; find out if it's alive.
+        if (AUTO_PROBE && isGhost(e)) queueProbe(e);
+      }
+    });
+
+    // Show the flagged rooms instead of dropping them. A room the API still
+    // returns with inLive:false is exactly the "gone from the list but still
+    // streaming" case — hiding it here made our board complicit in whatever
+    // the server was doing.
+    const sorted = sortRooms(live).concat(sortRooms(flagged).map((r) => ({ ...r, __hidden: true })));
+    cache[tab] = sorted;
+    sorted.forEach((r) => roomById.set(rid(r), r));
+    lastFlagged[tab] = flagged.length;
+    return sorted;
+  }
+
+  // Ask the room itself what it thinks it is now, and diff that against the
+  // last listing payload. enter's roomVo is the same shape as a list row, so
+  // the diff points straight at whatever field hides a room.
+  async function probeGhost(e) {
+    let enter = null, err = null;
+    try { enter = await api(`/video_living/${e.id}/enter`, { method: 'POST', params: { support_trtc: true } }); }
+    catch (ex) { err = ex.message; }
+    const rv = (enter && enter.roomVo) || null;
+    const diff = rv ? diffRooms(e.last, rv) : [];
+    const inOther = TABS.filter((t) => (cache[t] || []).some((r) => rid(r) === e.id));
+    push(e, 'probe' + (err ? ' FAILED' : rv ? '' : ' (no roomVo)'), { diff, raw: enter, err, inOther });
+    console.log('[ti-ghost] probe', e.id, { lastListing: e.last, enter, diff, err, alsoListedIn: inOther });
+    return { rv, err, enter, diff, inOther };
+  }
+
+  // Turn a probe result into a verdict. The distinction that matters is
+  // "unlisted but still enterable with live RTC creds" (the case worth
+  // chasing) vs "the host stopped" (noise). enter succeeding is NOT by itself
+  // proof of life — the server happily returns a room record for a stream that
+  // has ended, just with inLive false and no rtc credentials.
+  function classify(res) {
+    if (res.err) return { state: 'dead', why: 'enter failed — ' + res.err };
+    const rtc = !!(res.enter && res.enter.rtcAppId);
+    if (!res.rv) return { state: 'unclear', why: 'enter ok, no roomVo' + (rtc ? ' · rtc creds' : '') };
+    if (res.rv.inLive === false) return { state: 'ended', why: 'roomVo inLive=false' };
+    if (rtc) return { state: 'alive', why: 'enter ok · rtc creds' + (res.inOther.length ? ' · listed in ' + res.inOther.join(',') : ' · unlisted') };
+    return { state: 'unclear', why: 'roomVo ok but no rtc creds' };
+  }
+
+  // Probes run one at a time with a gap — a burst of enter calls the instant a
+  // scan finishes is both rude and a good way to get rate-limited.
+  const probeQueue = [];
+  let probing = false;
+
+  function queueProbe(e) {
+    if (e.probed) return;
+    e.probed = true;
+    e.verdict = { state: 'queued', why: 'waiting to probe' };
+    probeQueue.push(e);
+    runProbes();
+  }
+
+  async function runProbes() {
+    if (probing) return;
+    probing = true;
+    while (probeQueue.length) {
+      const e = probeQueue.shift();
+      if (!registry.has(e.id)) continue;                    // aged out mid-queue
+      if (!isGhost(e)) { e.verdict = null; e.probed = false; continue; }   // came back
+      // Already playing in one of our windows — we know it's alive, and
+      // re-entering would put our uid in the channel twice.
+      if (openRooms.has(e.id)) {
+        e.verdict = { state: 'alive', why: 'open in a player window' };
+        push(e, 'auto-probe skipped: already playing');
+        refreshGhosts();
+        continue;
+      }
+      e.verdict = { state: 'probing', why: '' };
+      refreshGhosts();
+      const res = await probeGhost(e);
+      e.verdict = classify(res);
+      e.verdict.diff = res.diff;
+      if (e.verdict.state === 'alive') {
+        console.log('%c[ti-ghost] ALIVE BUT UNLISTED', 'color:#7f7;font-weight:bold', e.id,
+          (e.last && (e.last.roomName || e.last.nickname)) || '',
+          res.diff.length ? '· changed: ' + res.diff.join(' | ') : '· no field changed vs last listing');
+        // Alive and unlisted is exactly the case worth chasing — go find out
+        // which list it moved to, if any. Cheap mode: the two big lists were
+        // enumerated seconds ago, so only the country filter gets walked.
+        if (AUTO_LOCATE) { try { await locateRoom(e, null, true); } catch (err) {} }
+      }
+      refreshGhosts();
+      await new Promise((r) => setTimeout(r, PROBE_GAP_MS));
+    }
+    probing = false;
+  }
+
+  function refreshGhosts() {
+    if (!statusEl) return;
+    if (activeTab === 'ghosts') renderList(); else updateTabStyles();
+  }
+
+  // ========================================================================
+  // LIST DISCOVERY  —  "gone from all lists" only means "gone from the two
+  // endpoints we know about". These probe for the ones we don't.
+  // ========================================================================
+  // Different list endpoints may wrap their payload under a different key.
+  const ROOMS_KEYS = ['rooms', 'list', 'records', 'items', 'data', 'roomList', 'liveRooms'];
+  function pickRooms(d) {
+    if (!d) return { rooms: [], key: null };
+    if (Array.isArray(d)) return { rooms: d, key: '(array)' };
+    for (const k of ROOMS_KEYS) {
+      if (Array.isArray(d[k]) && d[k].length && typeof d[k][0] === 'object') return { rooms: d[k], key: k };
+    }
+    for (const k of Object.keys(d)) {   // last resort: any array of objects
+      if (Array.isArray(d[k]) && d[k].length && typeof d[k][0] === 'object' && (d[k][0].roomId || d[k][0].strRoomId)) return { rooms: d[k], key: k };
+    }
+    return { rooms: [], key: null };
+  }
+  const hasId = (r) => !!(r && (r.roomId != null || r.strRoomId));
+
+  async function probeList(ep, params) {
+    try {
+      const d = await api(ep, { params });
+      const { rooms, key } = pickRooms(d);
+      return { ok: true, rooms: rooms.filter(hasId), key, hasMore: d && d.hasMore };
+    } catch (e) { return { ok: false, err: e.message, rooms: [] }; }
+  }
+
+  // Every list we can search for a specific room.
+  // cheap = skip re-walking the two lists we just enumerated (the auto path
+  // runs right after a scan, so those caches are seconds old).
+  function searchableLists(cc, cheap) {
+    const out = cheap ? [] : [
+      { label: 'regular', ep: '/video_living/rooms/v2', params: (p) => ({ page: p, size: PAGE_SZ, countryFilter: '' }), cap: 12 },
+      { label: 'premium', ep: '/video_living/premium/rooms/', params: (p) => ({ page: p, size: PAGE_SZ }), cap: 12 },
+    ];
+    // A room dropped from the unfiltered list can still be present under its
+    // own country filter — that alone would explain a "disappearance".
+    if (cc) out.push({ label: 'regular?countryFilter=' + cc, ep: '/video_living/rooms/v2', params: (p) => ({ page: p, size: PAGE_SZ, countryFilter: cc }), cap: 10 });
+    return out;
+  }
+
+  // Walk each searchable list looking for one room id. Answers "where does it
+  // live now" rather than just "is it gone".
+  async function locateRoom(e, onProgress, cheap) {
+    const cc = (e.last && e.last.countryCode) || '';
+    const lists = searchableLists(cc, cheap);
+    const found = [], searched = [];
+    for (const L of lists) {
+      if (onProgress) onProgress(L.label);
+      let hit = null;
+      for (let p = 1; p <= L.cap && !hit; p++) {
+        const res = await probeList(L.ep, L.params(p));
+        if (!res.ok) break;
+        const m = res.rooms.find((r) => rid(r) === e.id);
+        if (m) hit = { page: p, room: m };
+        if (!res.hasMore || !res.rooms.length) break;
+      }
+      searched.push(L.label);
+      if (hit) found.push({ list: L.label, page: hit.page, diff: diffRooms(e.last, hit.room), room: hit.room });
+    }
+    push(e, found.length ? 'located in ' + found.map((f) => f.list).join(', ') : 'not found in ' + searched.length + ' lists',
+      { diff: found.length ? found[0].diff : [] });
+    console.log('[ti-locate]', e.id, found.length ? found : 'not found in: ' + searched.join(', '));
+    if (found.length) {
+      e.verdict = { state: 'moved', why: 'now in ' + found.map((f) => f.list).join(', '), diff: found[0].diff };
+    }
+    return { found, searched };
+  }
+
+  window.__tiRegistry = registry;
+  window.__tiGhosts = ghosts;
+  window.__tiLocate = locateRoom;
+
   // ---- gather everything needed to play one room --------------------------
   // A single enter call returns provider, Agora appId/token, viewer uid, the
   // channel (strRoomId) and, for Tencent rooms, the LEB webrtc pull URL.
@@ -205,6 +558,11 @@
     try { e = await api(`/video_living/${rid(r)}/enter`, { method: 'POST', params: { support_trtc: true } }); }
     catch (ex) { err = ex.message; console.warn('[ti-rooms] enter failed', rid(r), ex.message); }
     const rv = e.roomVo || {};
+    // Playing a ghost is itself a datapoint: record what enter said about it.
+    const reg = registry.get(rid(r));
+    if (reg && isGhost(reg) && Object.keys(rv).length) {
+      push(reg, 'played while ghosted', { diff: diffRooms(reg.last, rv), raw: e });
+    }
     const provide = e.rtcProvide != null ? e.rtcProvide : r.rtcProvide;
     const appId = e.rtcAppId || null;
     const token = e.rtcToken || null;
@@ -222,6 +580,7 @@
   // with our uid twice). Tracked optimistically here; player windows send
   // 'ti-close' when a tile stops or the window unloads.
   const openRooms = new Set();
+  window.__tiOpen = openRooms;      // __tiOpen.clear() resets every stuck flag
 
   // ---- open direct player window (1 or up to 6 tiles) ---------------------
   async function openPlayers(sel) {
@@ -297,6 +656,10 @@
     // load the same channel in another window.
     var liveRooms = {};
     function announceClose(id) { if (window.opener) { try { window.opener.postMessage({ type: 'ti-close', roomId: id }, '*'); } catch (e) {} } delete liveRooms[id]; }
+    // A tile dying on its own (host left, channel torn down) is the moment a
+    // room actually stops streaming — tell the opener so it can separate
+    // "hidden but alive" from "really ended".
+    function announceEnd(id, why) { if (window.opener) { try { window.opener.postMessage({ type: 'ti-ended', roomId: id, why: why }, '*'); } catch (e) {} } }
     window.addEventListener('pagehide', function () { Object.keys(liveRooms).forEach(function (id) { if (window.opener) { try { window.opener.postMessage({ type: 'ti-close', roomId: id }, '*'); } catch (e) {} } }); });
 
     // Tencent TRTC (rtcProvide 2) — join as audience, subscribe to the host.
@@ -310,6 +673,7 @@
       trtc.on(TR.EVENT.REMOTE_AUDIO_AVAILABLE, function (ev) {
         audioUsers.push(ev.userId); try { trtc.muteRemoteAudio(ev.userId, muted); } catch (e) {}
       });
+      try { if (TR.EVENT.REMOTE_USER_EXIT) trtc.on(TR.EVENT.REMOTE_USER_EXIT, function () { announceEnd(room.roomId, 'host left (trtc)'); }); } catch (e) {}
       // Ignore autoplay-blocked (tiles start muted) so no click-to-dismiss prompt.
       try { if (TR.EVENT.AUTOPLAY_FAILED) trtc.on(TR.EVENT.AUTOPLAY_FAILED, function () {}); } catch (e) {}
       await trtc.enterRoom({
@@ -337,6 +701,7 @@
           if (kind === 'audio' && user.audioTrack) { audios.push(user.audioTrack); if (!muted) { try { user.audioTrack.setVolume(100); user.audioTrack.play(); } catch (e) {} } }
         } catch (e) { console.error('subscribe', e); }
       });
+      client.on('user-left', function () { announceEnd(room.roomId, 'host left (agora)'); });
       await client.join(room.appId, room.channel, room.token || null, room.viewerUid == null ? null : room.viewerUid);
       return {
         setMuted: function (m) { muted = m; audios.forEach(function (a) { try { a.setVolume(m ? 0 : 100); if (!m) a.play(); } catch (e) {} }); },
@@ -467,19 +832,105 @@
   let box, listEl, statusEl, tabBar, rooms = [];
   let activeTab = 'regular';
   const cache = { regular: null, premium: null, faves: null };
+  const lastFlagged = { regular: 0, premium: 0, faves: 0 };
   const tabBtns = {};
-  const selected = new Set();
   const roomById = new Map();
+  let watching = false, watchTimer = null, watchBtn = null;
+  // ---- favourites ---------------------------------------------------------
+  // The star on each row. We keep the whole payload, not just the id, so a
+  // favourite is still playable once it has dropped off every list — which is
+  // the entire point of the tab. Persisted so they survive a reload.
+  const FAVE_KEY = 'tiRoomFavorites';
+  const favorites = new Map();       // rid -> last known room payload
+  const faveState = new Map();       // rid -> { state, why }  (enterability)
+  let faveChecking = false;
+
+  function loadFavorites() {
+    try { (JSON.parse(localStorage.getItem(FAVE_KEY) || '[]') || []).forEach((r) => favorites.set(rid(r), r)); }
+    catch (e) { console.warn('[ti-rooms] could not read favourites', e.message); }
+  }
+  function saveFavorites() {
+    try { localStorage.setItem(FAVE_KEY, JSON.stringify([...favorites.values()])); }
+    catch (e) { console.warn('[ti-rooms] could not save favourites', e.message); }
+  }
+  function toggleFave(r) {
+    const id = rid(r);
+    if (favorites.has(id)) { favorites.delete(id); faveState.delete(id); }
+    else favorites.set(id, { ...r });
+    saveFavorites();
+    renderList();
+  }
+
+  // Ask each favourite whether it can still be entered. Serialised, and rooms
+  // already playing in one of our windows are reported without an enter call —
+  // rejoining would put our viewer uid in the channel twice.
+  async function checkFavorites(force) {
+    if (faveChecking) return;
+    faveChecking = true;
+    try {
+      for (const [id, r] of [...favorites]) {
+        if (!force && faveState.has(id) && faveState.get(id).state !== 'checking') continue;
+        if (openRooms.has(id)) { faveState.set(id, { state: 'open', why: 'in a player window' }); refreshFaves(); continue; }
+        faveState.set(id, { state: 'checking', why: '' });
+        refreshFaves();
+        let enter = null, err = null;
+        try { enter = await api(`/video_living/${id}/enter`, { method: 'POST', params: { support_trtc: true } }); }
+        catch (ex) { err = ex.message; }
+        const rv = (enter && enter.roomVo) || null;
+        const rtc = !!(enter && enter.rtcAppId);
+        let st;
+        if (err) st = { state: 'dead', why: err };
+        else if (rv && rv.inLive === false) st = { state: 'ended', why: 'inLive=false' };
+        else if (rtc) st = { state: 'enterable', why: rv && rv.onlineCount != null ? '👤 ' + rv.onlineCount : 'rtc creds' };
+        else st = { state: 'unclear', why: 'enter ok, no rtc creds' };
+        // Refresh the stored payload while we have a fresh one.
+        if (rv) { favorites.set(id, { ...r, ...rv }); saveFavorites(); }
+        faveState.set(id, st);
+        refreshFaves();
+        await new Promise((res) => setTimeout(res, 800));
+      }
+    } finally { faveChecking = false; refreshFaves(); }
+  }
+  function refreshFaves() { if (activeTab === 'favorites' && statusEl) renderList(); }
+
+  const FAVE_RANK = { enterable: 0, open: 0, unclear: 1, checking: 2, ended: 3, dead: 4 };
+  function favoriteRooms() {
+    const rank = (r) => {
+      const s = faveState.get(rid(r));
+      return s && FAVE_RANK[s.state] != null ? FAVE_RANK[s.state] : 2;
+    };
+    return [...favorites.values()].sort((a, b) => rank(a) - rank(b) || (b.onlineCount || 0) - (a.onlineCount || 0));
+  }
+
+  // Ghosts tab: most vanished rooms are from countries we don't care about.
+  // Three-way filter, cycled by the toggle at the top of the tab.
+  const GHOST_FILTERS = ['pinned', 'faves', 'all'];
+  const ghostMatch = {
+    pinned: (r) => PIN.includes((r.countryCode || '').toUpperCase()),
+    faves: (r) => FAVE_COUNTRIES.includes((r.countryCode || '').toUpperCase()),
+    all: () => true,
+  };
+  const ghostLabel = { pinned: '★ pinned', faves: '♥ ' + FAVE_COUNTRIES.join('·'), all: '☆ all' };
+  let ghostFilter = 'pinned', ghostHiddenCount = 0, ghostTotal = 0;
+
+  const ago = (t) => {
+    const s = Math.max(0, Math.round((Date.now() - t) / 1000));
+    return s < 60 ? s + 's' : s < 3600 ? Math.round(s / 60) + 'm' : (s / 3600).toFixed(1) + 'h';
+  };
 
   function buildUI() {
+    loadFavorites();
     box = document.createElement('div');
-    box.style.cssText = 'position:fixed;top:10px;left:10px;width:340px;max-height:88vh;display:flex;flex-direction:column;z-index:2147483647;background:#141414;color:#eee;font:13px/1.4 system-ui,sans-serif;border:1px solid #333;border-radius:10px;box-shadow:0 6px 26px rgba(0,0,0,.6)';
+    box.style.cssText = 'position:fixed;top:10px;left:10px;width:360px;max-height:88vh;display:flex;flex-direction:column;z-index:2147483647;background:#141414;color:#eee;font:13px/1.4 system-ui,sans-serif;border:1px solid #333;border-radius:10px;box-shadow:0 6px 26px rgba(0,0,0,.6)';
 
     const head = document.createElement('div');
     head.style.cssText = 'display:flex;gap:6px;align-items:center;padding:8px 10px;background:#1c1c1c;border-bottom:1px solid #2a2a2a;border-radius:10px 10px 0 0;cursor:move';
     head.innerHTML = '<b style="color:#6cf;flex:1">ti.live rooms</b>';
     const mk = (t, fn, extra) => { const b = document.createElement('button'); b.textContent = t; b.style.cssText = 'font:12px system-ui;background:#2b2b2b;color:#eee;border:1px solid #444;border-radius:6px;padding:3px 8px;cursor:pointer;' + (extra || ''); b.onclick = fn; return b; };
     head.appendChild(mk('⟳', () => loadTab(true), 'font-size:14px'));
+    watchBtn = mk('👁', () => setWatch(!watching), 'font-size:13px');
+    watchBtn.title = 'watch mode: re-scan every list every ' + Math.round(POLL_MS / 1000) + 's and track rooms that vanish';
+    head.appendChild(watchBtn);
     head.appendChild(mk('grid 6', () => openPlayers(pickForGrid()), 'background:#164a2a;border-color:#2a6'));
     head.appendChild(mk('▾', () => { const h = listEl.style.display === 'none'; listEl.style.display = h ? 'block' : 'none'; }));
 
@@ -489,7 +940,8 @@
     const mkTab = (key, label) => {
       const b = document.createElement('button');
       b.textContent = label;
-      b.style.cssText = 'flex:1;font:12px system-ui;background:transparent;color:#aaa;border:0;border-bottom:2px solid transparent;padding:7px 0;cursor:pointer';
+      b.dataset.base = label;
+      b.style.cssText = 'flex:1;min-width:0;font:11px system-ui;background:transparent;color:#aaa;border:0;border-bottom:2px solid transparent;padding:7px 2px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis';
       b.onclick = () => selectTab(key);
       tabBtns[key] = b;
       return b;
@@ -497,6 +949,8 @@
     tabBar.appendChild(mkTab('regular', 'Regular'));
     tabBar.appendChild(mkTab('premium', '★ Premium'));
     tabBar.appendChild(mkTab('faves', FAVE_COUNTRIES.join('·')));
+    tabBar.appendChild(mkTab('ghosts', '👻 Ghosts'));
+    tabBar.appendChild(mkTab('favorites', '⭐ Faves'));
 
     statusEl = document.createElement('div');
     statusEl.style.cssText = 'padding:5px 10px;color:#999;border-bottom:1px solid #222';
@@ -517,38 +971,104 @@
       b.style.borderBottomColor = on ? '#6cf' : 'transparent';
       b.style.background = on ? '#181818' : 'transparent';
     });
+    const g = ghosts().length;
+    if (tabBtns.ghosts) tabBtns.ghosts.textContent = '👻 Ghosts' + (g ? ' ' + g : '');
+    if (tabBtns.favorites) tabBtns.favorites.textContent = '⭐ Faves' + (favorites.size ? ' ' + favorites.size : '');
   }
 
   function selectTab(key) {
     if (key === activeTab) return;
     activeTab = key;
-    selected.clear();
     updateTabStyles();
-    loadTab(true);   // always re-fetch the list when switching tabs
+    if (key === 'ghosts') renderList();
+    // Switching to Favourites re-checks enterability for everything in it.
+    else if (key === 'favorites') { renderList(); checkFavorites(true); }
+    else loadTab(true);   // always re-fetch the list when switching tabs
   }
 
+  function setWatch(on) {
+    watching = on;
+    clearTimeout(watchTimer);
+    watchBtn.style.background = on ? '#164a2a' : '#2b2b2b';
+    watchBtn.style.borderColor = on ? '#2a6' : '#444';
+    if (!on) return;
+    (async function tick() {
+      // Scan every list, not just the active one — a room "vanishing" is often
+      // a room moving between lists, and we can only see that if we watch all.
+      for (const t of TABS) {
+        try { await scanTab(t); } catch (e) { console.warn('[ti-ghost] scan failed', t, e.message); }
+      }
+      if (activeTab !== 'ghosts') rooms = cache[activeTab] || rooms;
+      renderList();
+      if (watching) watchTimer = setTimeout(tick, POLL_MS);
+    })();
+  }
+
+  // Header "grid 6" — the first six of whatever tab you're on.
   function pickForGrid() {
-    if (selected.size) return rooms.filter((r) => selected.has(rid(r)));
     return rooms.slice(0, GRID_N);
   }
 
-  function renderRow(r) {
+  function renderRow(r, ghost) {
     const row = document.createElement('div');
     const pinned = PIN.includes((r.countryCode || '').toUpperCase());
-    row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:5px 10px;border-bottom:1px solid #1e1e1e;' + (pinned ? 'background:#15201a' : '');
+    const wrap = document.createElement('div');
+    const reg = ghost ? registry.get(rid(r)) : null;
+    const vst = (reg && reg.verdict && reg.verdict.state) || null;
+    row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:5px 10px;border-bottom:1px solid #1e1e1e;' +
+      (ghost ? (vst === 'moved' ? 'background:#152430;' : vst === 'alive' ? 'background:#16251c;' : vst === 'ended' || vst === 'dead' ? 'background:#1a1a1a;opacity:.62;' : 'background:#211a26;')
+             : r.__hidden ? 'background:#2a2113;' : pinned ? 'background:#15201a' : '') +
+      // Only dim in "all" mode — in faves mode GB is wanted but isn't in PIN,
+      // so keying the dim off `pinned` alone would grey out a row you asked for.
+      (ghost && ghostFilter === 'all' && !pinned ? 'opacity:.4;' : '');
 
-    const cb = document.createElement('input');
-    cb.type = 'checkbox'; cb.checked = selected.has(rid(r));
-    cb.onchange = () => { cb.checked ? selected.add(rid(r)) : selected.delete(rid(r)); updateStatus(); };
+    // Favourite toggle. Stores the room's payload, not just its id, so a
+    // favourite stays playable after it drops off every list.
+    const isFav = favorites.has(rid(r));
+    const cb = document.createElement('button');
+    cb.textContent = isFav ? '★' : '☆';
+    cb.title = isFav ? 'remove from favourites' : 'add to favourites';
+    cb.style.cssText = 'flex:0 0 auto;background:none;border:0;cursor:pointer;font-size:16px;line-height:1;padding:0 2px;color:' + (isFav ? '#e6b04a' : '#555');
+    cb.onclick = (ev) => { ev.stopPropagation(); toggleFave(r); };
 
     const thumb = document.createElement('div');
-    thumb.style.cssText = `width:34px;height:34px;border-radius:6px;flex:0 0 auto;background:#333 center/cover no-repeat;${r.frontImage ? `background-image:url('${r.frontImage}')` : ''}`;
+    thumb.style.cssText = `width:34px;height:34px;border-radius:6px;flex:0 0 auto;background:#333 center/cover no-repeat;${r.frontImage ? `background-image:url('${r.frontImage}')` : ''}${ghost ? ';filter:grayscale(1) brightness(.7)' : ''}`;
 
     const meta = document.createElement('div');
     meta.style.cssText = 'flex:1;min-width:0';
+    const e = reg;
+    const gone = e ? goneAt(e) : 0;
+    // Auto-probe verdict, rendered as a badge line under the room.
+    const BADGE = {
+      moved:   ['#7fd0ff', '➜ moved'],
+      alive:   ['#7f7', '● alive · unlisted'],
+      ended:   ['#888', '○ ended'],
+      dead:    ['#c88', '✕ gone'],
+      unclear: ['#e0b060', '? unclear'],
+      probing: ['#8cf', '… probing'],
+      queued:  ['#666', '… queued'],
+    };
+    // In the Favourites tab the badge comes from the enterability check
+    // instead of the ghost verdict.
+    const FAVE_BADGE = {
+      enterable: ['#7f7', '● enterable'],
+      open:      ['#5c5', '● playing now'],
+      ended:     ['#888', '○ ended'],
+      dead:      ['#c88', '✕ not enterable'],
+      unclear:   ['#e0b060', '? unclear'],
+      checking:  ['#8cf', '… checking'],
+    };
+    const fs = activeTab === 'favorites' ? faveState.get(rid(r)) : null;
+    const bd = fs ? FAVE_BADGE[fs.state] : (vst && BADGE[vst]);
+    const why = fs ? fs.why : (e && e.verdict && e.verdict.why);
     meta.innerHTML =
       `<div style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${(r.roomName || r.nickname || r.strRoomId || '').replace(/[<>&]/g, '')}${r.isPremium ? ' <span style="color:#e6b04a">★</span>' : ''}</div>` +
-      `<div style="color:#888;font-size:11px">${openRooms.has(rid(r)) ? '<span style="color:#5c5">● open</span> · ' : ''}<span style="color:${pinned ? '#6f6' : '#9bd'}">${r.countryCode || '??'}</span> · 👤 ${r.onlineCount || 0}</div>`;
+      `<div style="color:#888;font-size:11px">${openRooms.has(rid(r)) ? '<span style="color:#5c5">● open</span> · ' : ''}` +
+      `${r.__hidden ? '<span style="color:#e0b060">⊘ hidden (inLive=false)</span> · ' : ''}` +
+      `${ghost ? `<span style="color:#b98cd8">gone ${ago(gone)}</span> · from ${Object.keys(e.goneFrom).join(',')} · ` : ''}` +
+      `<span style="color:${pinned ? '#6f6' : '#9bd'}">${r.countryCode || '??'}</span> · 👤 ${r.onlineCount || 0}</div>` +
+      (bd ? `<div style="color:${bd[0]};font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${bd[1]}${why ? ' <span style="color:#777">· ' + String(why).replace(/[<>&]/g, '') + '</span>' : ''}</div>` : '') +
+      (!fs && bd && e.verdict.diff && e.verdict.diff.length ? `<div style="color:#c9a6e8;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${e.verdict.diff.join(' | ').replace(/["<>&]/g, '')}">Δ ${e.verdict.diff.join(' · ').replace(/[<>&]/g, '')}</div>` : '');
 
     const play = document.createElement('button');
     play.textContent = '▶ play';
@@ -556,13 +1076,165 @@
     play.onclick = () => openPlayers([r]);
 
     row.append(cb, thumb, meta, play);
-    return row;
+    wrap.appendChild(row);
+
+    // "open" is tracked optimistically — we mark a room open when we start
+    // loading it and rely on the player window to report back when it stops.
+    // If that window is closed abruptly, or the tile never connected, the flag
+    // can get stuck. This clears it for one room.
+    if (openRooms.has(rid(r))) {
+      const clr = document.createElement('button');
+      clr.textContent = '↺';
+      clr.title = 'clear the "open" flag — use when a room shows open but is not actually playing';
+      clr.style.cssText = 'font:12px system-ui;background:#4a2b2b;color:#fdd;border:1px solid #8a4848;border-radius:6px;padding:3px 8px;cursor:pointer';
+      clr.onclick = (ev) => {
+        ev.stopPropagation();
+        openRooms.delete(rid(r));
+        faveState.delete(rid(r));      // drop a stale "playing now" verdict too
+        renderList();
+        // Re-check just this one: checkFavorites without force only probes
+        // favourites that have no state yet.
+        if (activeTab === 'favorites') checkFavorites(false);
+      };
+      row.insertBefore(clr, play);
+    }
+
+    if (ghost) {
+      // Probe: ask /enter what the room says about itself now, and diff that
+      // against the last listing payload. Whatever changed is what hid it.
+      const detail = document.createElement('pre');
+      detail.style.cssText = 'display:none;margin:0;padding:6px 10px;background:#0e0e0e;color:#9c9;font:11px/1.35 ui-monospace,monospace;white-space:pre-wrap;word-break:break-all;border-bottom:1px solid #1e1e1e;max-height:220px;overflow:auto';
+      const probe = document.createElement('button');
+      probe.textContent = '🔍';
+      probe.title = 'probe: enter the room and diff it against its last listing';
+      probe.style.cssText = 'font:12px system-ui;background:#3a2b4a;color:#e8d8ff;border:1px solid #64488a;border-radius:6px;padding:3px 8px;cursor:pointer';
+      probe.onclick = async () => {
+        probe.disabled = true; probe.textContent = '…';
+        detail.style.display = 'block';
+        detail.textContent = 'probing ' + rid(r) + '…';
+        const res = await probeGhost(e);
+        e.probed = true;
+        e.verdict = classify(res);
+        e.verdict.diff = res.diff;
+        detail.textContent = [
+          'verdict: ' + e.verdict.state.toUpperCase() + ' — ' + e.verdict.why,
+          'enter: ' + (res.err ? 'FAILED — ' + res.err : res.rv ? 'ok, roomVo returned' : 'ok, but no roomVo'),
+          res.inOther.length ? 'currently listed in: ' + res.inOther.join(', ') : 'not in any list we scan',
+          '',
+          res.diff.length ? 'changed vs last listing:\n  ' + res.diff.join('\n  ') : 'no scalar field changed vs last listing',
+          '',
+          'history:',
+          ...e.history.slice(-12).map((h) => '  [' + ago(h.t) + ' ago] ' + h.ev + (h.diff && h.diff.length ? '\n      ' + h.diff.join('\n      ') : '')),
+          '',
+          '(full enter payload logged to console)',
+        ].join('\n');
+        probe.disabled = false; probe.textContent = '🔍';
+      };
+      // Locate: walk every searchable list looking for this room id, so a
+      // "disappearance" that is really a move gets named as one.
+      const loc = document.createElement('button');
+      loc.textContent = '📍';
+      loc.title = 'locate: search every known list (plus this room\'s country filter) for it';
+      loc.style.cssText = 'font:12px system-ui;background:#23394a;color:#dff;border:1px solid #3a6a8a;border-radius:6px;padding:3px 8px;cursor:pointer';
+      loc.onclick = async () => {
+        loc.disabled = true;
+        detail.style.display = 'block';
+        const res = await locateRoom(e, (l) => { detail.textContent = 'searching ' + l + '…'; });
+        detail.textContent = res.found.length
+          ? ['FOUND — the room moved, it did not stop.', '',
+             ...res.found.map((f) => '  ' + f.list + ' (page ' + f.page + ')' + (f.diff.length ? '\n      changed: ' + f.diff.join('\n      changed: ') : '\n      identical payload')),
+            ].join('\n')
+          : 'not found in any of ' + res.searched.length + ' lists:\n  ' + res.searched.join('\n  ') +
+            '\n\nEither it really is off every list, or the list holding it is one we do not know.\nRun 🔎 Lists to hunt for endpoints we are not probing.';
+        loc.disabled = false;
+        updateTabStyles();
+      };
+      row.insertBefore(loc, play);
+      row.insertBefore(probe, loc);
+      wrap.appendChild(detail);
+    }
+    return wrap;
   }
 
   // Rows are chunked into groups of GRID_N, each led by a divider with a
   // button that launches exactly those rooms as a grid.
   function renderList() {
     listEl.innerHTML = '';
+    const ghostMode = activeTab === 'ghosts';
+    const faveMode = activeTab === 'favorites';
+    if (ghostMode) {
+      const all = ghosts().map((e) => e.last).filter(Boolean);
+      ghostTotal = all.length;
+      rooms = all.filter(ghostMatch[ghostFilter]);
+      ghostHiddenCount = all.length - rooms.length;
+    }
+
+    if (faveMode) {
+      rooms = favoriteRooms();
+      const ctl = document.createElement('div');
+      ctl.style.cssText = 'display:flex;align-items:center;gap:8px;padding:6px 10px;border-bottom:1px solid #1e1e1e';
+      const re = document.createElement('button');
+      re.textContent = faveChecking ? 'checking…' : '⟳ recheck';
+      re.disabled = faveChecking;
+      re.style.cssText = 'font:12px system-ui;background:#22406a;color:#dff;border:1px solid #356;border-radius:6px;padding:3px 9px;cursor:pointer';
+      re.onclick = () => checkFavorites(true);
+      const note = document.createElement('span');
+      note.style.cssText = 'color:#777;font-size:11px;flex:1';
+      const live = rooms.filter((r) => { const s = faveState.get(rid(r)); return s && (s.state === 'enterable' || s.state === 'open'); }).length;
+      note.textContent = rooms.length ? `${live} of ${rooms.length} enterable` : '';
+      ctl.append(re, note);
+      listEl.appendChild(ctl);
+
+      if (!rooms.length) {
+        const empty = document.createElement('div');
+        empty.style.cssText = 'padding:14px 12px;color:#888;font-size:12px;line-height:1.5';
+        empty.innerHTML = 'No favourites yet. Click the ☆ beside any room — on any tab, including 👻 Ghosts — to keep it here. ' +
+          'Favourites store the room\'s full payload, so they stay playable after the room drops off every list, ' +
+          'and this tab re-checks whether each one can still be entered every time you open it.';
+        listEl.appendChild(empty);
+        updateStatus();
+        return;
+      }
+    }
+
+    if (ghostMode) {
+      // Filter toggle. Rendered BEFORE the empty check — filtering everything
+      // out must not strand you without a way to switch back.
+      const ctl = document.createElement('div');
+      ctl.style.cssText = 'display:flex;align-items:center;gap:8px;padding:6px 10px;border-bottom:1px solid #1e1e1e';
+      const tg = document.createElement('button');
+      tg.textContent = ghostLabel[ghostFilter];
+      tg.title = 'click to cycle: pinned → ' + FAVE_COUNTRIES.join('/') + ' → all';
+      const tone = { pinned: ['#164a2a', '#2a6', '#dff'], faves: ['#3a2b4a', '#64488a', '#e8d8ff'], all: ['#2b2b2b', '#444', '#aaa'] }[ghostFilter];
+      tg.style.cssText = `font:12px system-ui;border-radius:6px;padding:3px 9px;cursor:pointer;background:${tone[0]};border:1px solid ${tone[1]};color:${tone[2]}`;
+      tg.onclick = () => {
+        ghostFilter = GHOST_FILTERS[(GHOST_FILTERS.indexOf(ghostFilter) + 1) % GHOST_FILTERS.length];
+        renderList();
+      };
+      const note = document.createElement('span');
+      note.style.cssText = 'color:#777;font-size:11px;flex:1';
+      note.textContent = ghostTotal
+        ? rooms.length + ' of ' + ghostTotal + (ghostHiddenCount ? ' · ' + ghostHiddenCount + (ghostFilter === 'all' ? ' dimmed' : ' filtered out') : '')
+        : 'no ghosts yet';
+      ctl.append(tg, note);
+      listEl.appendChild(ctl);
+
+      if (!rooms.length) {
+        const empty = document.createElement('div');
+        empty.style.cssText = 'padding:14px 12px;color:#888;font-size:12px;line-height:1.5';
+        empty.innerHTML = ghostHiddenCount
+          ? `all ${ghostHiddenCount} ghost(s) are filtered out by <b>${ghostLabel[ghostFilter]}</b> — click the toggle to widen it.`
+          : watching
+            ? 'No ghosts yet. Watching every list every ' + Math.round(POLL_MS / 1000) + 's — a room shows up here once it misses ' + MISS_STRIKES + ' consecutive scans of every list it was in'
+              + (AUTO_PROBE ? ', and gets probed on arrival so the still-enterable ones sort to the top.' : '. Auto-probe is off; use 🔍 per row.')
+            : 'Ghost tracking needs watch mode. Hit 👁 in the header, leave it running, and rooms that drop off the listings collect here with their last payload.';
+        listEl.appendChild(empty);
+        updateStatus();
+        return;
+      }
+
+    }
+
     for (let start = 0; start < rooms.length; start += GRID_N) {
       const group = rooms.slice(start, start + GRID_N);
 
@@ -578,18 +1250,40 @@
       divider.append(label, gbtn);
       listEl.appendChild(divider);
 
-      group.forEach((r) => listEl.appendChild(renderRow(r)));
+      group.forEach((r) => listEl.appendChild(renderRow(r, ghostMode)));
     }
     updateStatus();
   }
 
   function updateStatus() {
+    updateTabStyles();
+    if (activeTab === 'favorites') {
+      const tally = {};
+      favorites.forEach((r, id) => { const s = (faveState.get(id) || {}).state || 'unchecked'; tally[s] = (tally[s] || 0) + 1; });
+      const parts = Object.keys(tally).sort().map((k) => tally[k] + ' ' + k).join(' · ');
+      statusEl.innerHTML = `favourites · ${favorites.size}` + (parts ? ' · ' + parts : '') +
+        (faveChecking ? ' · <span style="color:#8cf">checking…</span>' : '');
+      return;
+    }
+    if (activeTab === 'ghosts') {
+      const tally = {};
+      ghosts().forEach((e) => { const s = (e.verdict && e.verdict.state) || 'unprobed'; tally[s] = (tally[s] || 0) + 1; });
+      const alive = tally.alive || 0;
+      const parts = Object.keys(tally).sort().map((k) => tally[k] + ' ' + k).join(' · ');
+      statusEl.innerHTML = `ghosts · ${rooms.length}/${ghostTotal} ${ghostLabel[ghostFilter]}` + (parts ? ' · ' + parts : '') +
+        (alive ? ` <span style="color:#7f7">← ${alive} still enterable</span>` : '') +
+        ` · watch ${watching ? 'ON' : 'off'}${AUTO_PROBE ? '' : ' · auto-probe off'}`;
+      return;
+    }
     const pins = rooms.filter((r) => PIN.includes((r.countryCode || '').toUpperCase())).length;
-    statusEl.textContent = `${activeTab} · ${rooms.length} rooms · ${pins} pinned · ${selected.size} picked`;
+    const flag = lastFlagged[activeTab] ? ` · ${lastFlagged[activeTab]} inLive=false` : '';
+    statusEl.textContent = `${activeTab} · ${rooms.length} rooms · ${pins} pinned · ${favorites.size} ★${flag}${watching ? ' · 👁' : ''}`;
   }
 
   let loadTries = 0;
   async function loadTab(force) {
+    if (activeTab === 'favorites') { renderList(); if (force) checkFavorites(true); return; }
+    if (activeTab === 'ghosts') { renderList(); return; }
     if (!Object.keys(capturedHeaders).length) {
       loadTries++;
       statusEl.textContent = loadTries > 8
@@ -604,12 +1298,7 @@
     statusEl.textContent = activeTab === 'premium' ? 'enumerating premium…'
       : activeTab === 'faves' ? 'loading ' + FAVE_COUNTRIES.join('/') + '…' : 'loading all rooms…';
     try {
-      const raw = activeTab === 'premium' ? await fetchPremium()
-        : activeTab === 'faves' ? await fetchFaves() : await fetchRegular();
-      const sorted = sortRooms(raw.filter((r) => r.inLive !== false));
-      cache[activeTab] = sorted;
-      sorted.forEach((r) => roomById.set(rid(r), r));
-      rooms = sorted;
+      rooms = await scanTab(activeTab);
       renderList();
     } catch (e) {
       statusEl.textContent = '⚠ ' + e.message;
@@ -627,6 +1316,16 @@
     window.addEventListener('mousemove', (e) => { if (!drag) return; el.style.left = ox + (e.clientX - sx) + 'px'; el.style.top = oy + (e.clientY - sy) + 'px'; });
     window.addEventListener('mouseup', () => { drag = false; });
   }
+
+  // A tile reporting the host left is the one unambiguous "really ended"
+  // signal we get — note it so ghosts can be told apart from dead rooms.
+  window.addEventListener('message', (e) => {
+    const m = e.data || {};
+    if (m && m.type === 'ti-ended' && m.roomId) {
+      const reg = registry.get(String(m.roomId));
+      if (reg) { push(reg, 'stream ended: ' + (m.why || '?')); console.log('[ti-ghost] stream ended', m.roomId, m.why); }
+    }
+  });
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', buildUI);
   else buildUI();
