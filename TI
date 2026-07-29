@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ti.live Room Board (direct stream + 6-up grid)
 // @namespace    https://app.ti.live/
-// @version      5.6
-// @description  Signs api.ti.live requests (reverse-engineered CheckSum), lists ALL live rooms sorted by online count (US/UA/RU pinned), plays streams DIRECTLY (Agora subscribe for rtcProvide 1, Tencent TRTC for rtcProvide 2) room-by-room or as a 6-up grid (blob window). Tile click pops out. Ghost tracking keeps rooms that vanish from the listings, shows rooms the API flags inLive=false, and probes ghosts to see which are still enterable.
+// @version      5.7
+// @description  Signs api.ti.live requests (reverse-engineered CheckSum), lists ALL live rooms sorted by online count (US/UA/RU pinned), plays streams DIRECTLY (Agora subscribe for rtcProvide 1, Tencent TRTC for rtcProvide 2) room-by-room or as a 6-up grid (blob window). Tile click pops out. Ghost tracking keeps rooms that vanish from the listings, shows rooms the API flags inLive=false, and probes ghosts to see which are still enterable. Favourites import/export as JSON.
 // @match        https://app.ti.live/*
 // @run-at       document-start
 // @grant        none
@@ -861,6 +861,100 @@
     renderList();
   }
 
+  // ---- favourite import / export -----------------------------------------
+  // Exports the whole stored payload per favourite, not just ids: an id alone
+  // is useless once a room has dropped off every list, which is exactly when
+  // you want your list back. Versioned envelope so a later format change is
+  // detected rather than silently mis-parsed.
+  const FAVE_FORMAT = 'ti.live-favorites';
+  const FAVE_VERSION = 1;
+
+  const faveEnvelope = () => ({
+    format: FAVE_FORMAT, version: FAVE_VERSION,
+    exportedAt: new Date().toISOString(),
+    count: favorites.size,
+    rooms: [...favorites.values()],
+  });
+
+  function exportFavorites() {
+    if (!favorites.size) { flashFaveNote('nothing to export'); return; }
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+    const url = URL.createObjectURL(new Blob([JSON.stringify(faveEnvelope(), null, 2)], { type: 'application/json' }));
+    const a = document.createElement('a');
+    a.href = url; a.download = 'ti-favorites-' + stamp + '.json';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    flashFaveNote('exported ' + favorites.size);
+  }
+
+  // Accepts our own envelope, a bare array, or {rooms|favorites|list:[…]} —
+  // a hand-edited or older file shouldn't need a converter.
+  function parseFaveFile(text) {
+    let d;
+    try { d = JSON.parse(text); } catch (e) { throw new Error('not valid JSON — ' + e.message); }
+    const arr = Array.isArray(d) ? d
+      : (d && Array.isArray(d.rooms)) ? d.rooms
+      : (d && Array.isArray(d.favorites)) ? d.favorites
+      : (d && Array.isArray(d.list)) ? d.list : null;
+    if (!arr) throw new Error('no room array found (expected {rooms:[…]} or a bare array)');
+    const rooms = arr.filter((r) => r && typeof r === 'object' && hasId(r));
+    if (!rooms.length) throw new Error(arr.length + ' entries, none with a roomId');
+    return { rooms, skipped: arr.length - rooms.length };
+  }
+
+  function importFavorites(text, replace) {
+    const { rooms, skipped } = parseFaveFile(text);
+    if (replace) { favorites.clear(); faveState.clear(); }
+    let added = 0, updated = 0;
+    rooms.forEach((r) => {
+      const id = rid(r);
+      if (favorites.has(id)) updated++; else added++;
+      // Merge lets what we already hold win: an imported payload can be months
+      // old, and a room we've scanned this session has fresher fields. The
+      // import fills gaps rather than overwriting live data.
+      favorites.set(id, replace ? { ...r } : { ...r, ...favorites.get(id) });
+      faveState.delete(id);   // enterability is per-session — re-check it
+    });
+    saveFavorites();
+    renderList();
+    checkFavorites(true);
+    return { added, updated, skipped };
+  }
+
+  function pickFaveFile(replace) {
+    const inp = document.createElement('input');
+    inp.type = 'file';
+    inp.accept = '.json,application/json';
+    inp.style.display = 'none';
+    inp.onchange = () => {
+      const f = inp.files && inp.files[0];
+      inp.remove();
+      if (!f) return;
+      const fr = new FileReader();
+      fr.onload = () => {
+        try {
+          const res = importFavorites(String(fr.result), replace);
+          flashFaveNote((replace ? 'replaced · ' : '') + res.added + ' new · ' + res.updated + ' already had'
+            + (res.skipped ? ' · ' + res.skipped + ' skipped' : ''));
+        } catch (e) { flashFaveNote('⚠ ' + e.message); console.warn('[ti-faves] import failed', e); }
+      };
+      fr.onerror = () => flashFaveNote('⚠ could not read file');
+      fr.readAsText(f);
+    };
+    document.body.appendChild(inp);
+    inp.click();
+  }
+
+  // Import/export feedback shares the control row's note slot, so it doesn't
+  // need its own line in a 360px panel.
+  let faveNote = '', faveNoteTimer = null;
+  function flashFaveNote(msg) {
+    faveNote = msg;
+    clearTimeout(faveNoteTimer);
+    faveNoteTimer = setTimeout(() => { faveNote = ''; refreshFaves(); }, 6000);
+    refreshFaves();
+  }
+
   // Ask each favourite whether it can still be entered. Serialised, and rooms
   // already playing in one of our windows are reported without an enter call —
   // rejoining would put our viewer uid in the channel twice.
@@ -1181,8 +1275,22 @@
       const note = document.createElement('span');
       note.style.cssText = 'color:#777;font-size:11px;flex:1';
       const live = rooms.filter((r) => { const s = faveState.get(rid(r)); return s && (s.state === 'enterable' || s.state === 'open'); }).length;
-      note.textContent = rooms.length ? `${live} of ${rooms.length} enterable` : '';
-      ctl.append(re, note);
+      note.textContent = faveNote || (rooms.length ? `${live} of ${rooms.length} enterable` : '');
+      if (faveNote) note.style.color = faveNote[0] === '⚠' ? '#e08080' : '#8cf';
+      const mkIo = (label, title, fn) => {
+        const b = document.createElement('button');
+        b.textContent = label; b.title = title;
+        b.style.cssText = 'font:12px system-ui;background:#2b2b2b;color:#dfd;border:1px solid #444;border-radius:6px;padding:3px 8px;cursor:pointer';
+        b.onclick = fn;
+        return b;
+      };
+      const ex = mkIo('⇩', 'export favourites to a .json file', () => exportFavorites());
+      const im = mkIo('⇧', 'import favourites from a .json file — merges by default, shift-click to replace', (ev) => {
+        const replace = ev.shiftKey;
+        if (replace && favorites.size && !confirm('Replace all ' + favorites.size + ' favourite(s) with the file contents?')) return;
+        pickFaveFile(replace);
+      });
+      ctl.append(re, ex, im, note);
       listEl.appendChild(ctl);
 
       if (!rooms.length) {
@@ -1190,7 +1298,8 @@
         empty.style.cssText = 'padding:14px 12px;color:#888;font-size:12px;line-height:1.5';
         empty.innerHTML = 'No favourites yet. Click the ☆ beside any room — on any tab, including 👻 Ghosts — to keep it here. ' +
           'Favourites store the room\'s full payload, so they stay playable after the room drops off every list, ' +
-          'and this tab re-checks whether each one can still be entered every time you open it.';
+          'and this tab re-checks whether each one can still be entered every time you open it. ' +
+          'Already have a list from another browser? Hit <b>⇧</b> above to import it.';
         listEl.appendChild(empty);
         updateStatus();
         return;
